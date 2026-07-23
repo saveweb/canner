@@ -1,0 +1,11 @@
+{
+  "listen_addr": ":8080",
+  "issuer": "https://canner.example",
+  "data_dir": "./data",
+  "max_upload_bytes": 107374182400,
+  "projects": {
+    "example": {
+      "token_sha256": "replace-with-output-from-canner-hash-token"
+    }
+  }
+}

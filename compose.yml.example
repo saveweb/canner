@@ -1,0 +1,9 @@
+services:
+  canner:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./data/canner:/app/data
