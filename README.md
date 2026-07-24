@@ -48,6 +48,31 @@ algorithm-neutral; this canner version accepts `blake3` for uploaded content.
 
 `GET /healthz` is unauthenticated and returns process health.
 
+## Go client
+
+Workers can use the public `github.com/saveweb/canner/client` package instead
+of implementing tus directly:
+
+```go
+canner, err := client.New("https://canner.example")
+if err != nil {
+	return err
+}
+receipt, err := canner.UploadFile(ctx, "project-id", "artifact.warc.gz")
+if err != nil {
+	return err
+}
+```
+
+`UploadFile` computes BLAKE3, creates the tus upload, resumes from the server's
+current offset, honors `429`/`503` `Retry-After`, and returns the decoded
+receipt. Its retry lifetime is controlled by `ctx`.
+
+For recovery across worker restarts, call `Create`, persist the returned
+JSON-compatible `client.Session`, and call `Resume` with the unchanged artifact.
+`Resume` verifies the artifact against the session before sending data. The
+client also exposes `Receipt` for explicit receipt recovery by object ID.
+
 ## Delivery
 
 Each project may configure an `internet_archive` delivery sink. The credentials

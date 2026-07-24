@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	cannerclient "github.com/saveweb/canner/client"
 	"github.com/zeebo/blake3"
 )
 
@@ -84,6 +85,24 @@ func TestUploadReturnsAndPersistsReceipt(t *testing.T) {
 	restarted.handler.ServeHTTP(response, request)
 	if response.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("DELETE accepted upload status = %d, want 405", response.Code)
+	}
+}
+
+func TestGoClientUploadsToReceiver(t *testing.T) {
+	s := testServer(t)
+	httpServer := httptest.NewServer(s.handler)
+	defer httpServer.Close()
+	client, err := cannerclient.New(httpServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("artifact through client")
+	receipt, err := client.Upload(t.Context(), "test", "artifact.warc.gz", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Checksum != blake3Checksum(body) || receipt.SizeBytes != int64(len(body)) || receipt.ObjectID == "" {
+		t.Fatalf("receipt = %+v", receipt)
 	}
 }
 
