@@ -2,14 +2,11 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 )
 
@@ -22,7 +19,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: canner {serve|deliver|deliveries} <config.json> | hash-token <token>")
+		return fmt.Errorf("usage: canner {serve|deliver|deliveries} <config.json>")
 	}
 	switch args[0] {
 	case "serve":
@@ -59,13 +56,6 @@ func run(args []string) error {
 			return err
 		}
 		return printDeliveries(context.Background(), cfg, os.Stdout)
-	case "hash-token":
-		if len(args) != 2 || strings.TrimSpace(args[1]) == "" {
-			return fmt.Errorf("usage: canner hash-token <token>")
-		}
-		sum := sha256.Sum256([]byte(args[1]))
-		fmt.Println(hex.EncodeToString(sum[:]))
-		return nil
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}

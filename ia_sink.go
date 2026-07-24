@@ -21,6 +21,11 @@ type internetArchiveSink struct {
 	secretKey string
 }
 
+type deliveryResult struct {
+	RemoteID   string
+	RemoteName string
+}
+
 func newInternetArchiveSink(project string, cfg deliveryConfig) (artifactSink, error) {
 	accessKey, secretKey, err := utils.ReadKeysFromFile(cfg.CredentialsFile)
 	if err != nil {
@@ -29,9 +34,9 @@ func newInternetArchiveSink(project string, cfg deliveryConfig) (artifactSink, e
 	return &internetArchiveSink{project: project, cfg: cfg, accessKey: accessKey, secretKey: secretKey}, nil
 }
 
-func (s *internetArchiveSink) deliver(ctx context.Context, job deliveryJob, localPath string) (string, error) {
+func (s *internetArchiveSink) deliver(ctx context.Context, job deliveryJob, localPath string) (deliveryResult, error) {
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return deliveryResult{}, err
 	}
 	values := map[string]string{
 		"{{PROJECT}}":   s.project,
@@ -42,7 +47,7 @@ func (s *internetArchiveSink) deliver(ctx context.Context, job deliveryJob, loca
 	identifier := resolveDeliveryTemplate(s.cfg.Identifier, values)
 	remoteName := resolveDeliveryTemplate(s.cfg.RemoteName, values)
 	if remoteName == "" || remoteName == "." || strings.Contains(remoteName, `\`) || strings.HasPrefix(remoteName, "/") || strings.HasSuffix(remoteName, "/") || path.Clean(remoteName) != remoteName || strings.HasPrefix(remoteName, "../") {
-		return "", fmt.Errorf("resolved remote name %q is invalid", remoteName)
+		return deliveryResult{}, fmt.Errorf("resolved remote name %q is invalid", remoteName)
 	}
 	metadata := make(map[string][]string, len(s.cfg.Metadata))
 	for key, input := range s.cfg.Metadata {
@@ -57,9 +62,9 @@ func (s *internetArchiveSink) deliver(ctx context.Context, job deliveryJob, loca
 	defer cancel()
 	client := &http.Client{Timeout: deliveryAttemptTimeout}
 	if err := uploadToInternetArchive(uploadCtx, client, identifier, files, metadata, s.accessKey, s.secretKey); err != nil {
-		return "", err
+		return deliveryResult{}, err
 	}
-	return identifier, nil
+	return deliveryResult{RemoteID: identifier, RemoteName: remoteName}, nil
 }
 
 func uploadToInternetArchive(ctx context.Context, client *http.Client, identifier string, files map[string]string, metadata map[string][]string, accessKey, secretKey string) (err error) {

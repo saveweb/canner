@@ -14,12 +14,13 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+	"github.com/tus/tusd/v2/pkg/filelocker"
 	"github.com/tus/tusd/v2/pkg/filestore"
 	_ "modernc.org/sqlite"
 )
 
 const (
-	deliveryPollInterval      = 5 * time.Second
+	deliveryPollInterval      = time.Second
 	deliveryReconcileInterval = time.Hour
 )
 
@@ -33,9 +34,15 @@ type deliveryJob struct {
 	NextAttempt int64   `json:"next_attempt_at"`
 	LastError   *string `json:"last_error"`
 	RemoteID    *string `json:"remote_id"`
+	RemoteName  *string `json:"remote_name"`
 	UpdatedAt   int64   `json:"updated_at"`
 	DeliveredAt *int64  `json:"delivered_at"`
+	PurgeAfter  *int64  `json:"purge_after"`
+	NextPurgeAt *int64  `json:"next_purge_attempt_at"`
+	PurgedAt    *int64  `json:"purged_at"`
 }
+
+const deliveryColumns = `object_id,project,filename,accepted_at,state,attempts,next_attempt_at,last_error,remote_id,remote_name,updated_at,delivered_at,purge_after,next_purge_attempt_at,purged_at`
 
 type deliveryStore struct {
 	db *sql.DB
@@ -63,10 +70,15 @@ func openDeliveryStore(dataDir string) (*deliveryStore, error) {
             next_attempt_at INTEGER NOT NULL,
             last_error TEXT,
             remote_id TEXT,
+            remote_name TEXT,
             updated_at INTEGER NOT NULL,
-            delivered_at INTEGER
+            delivered_at INTEGER,
+            purge_after INTEGER,
+            next_purge_attempt_at INTEGER,
+            purged_at INTEGER
         ) STRICT`,
 		`CREATE INDEX IF NOT EXISTS deliveries_due_idx ON deliveries(state,next_attempt_at,accepted_at,object_id)`,
+		`CREATE INDEX IF NOT EXISTS deliveries_purge_idx ON deliveries(purged_at,next_purge_attempt_at,purge_after,object_id)`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			db.Close()
@@ -89,7 +101,7 @@ func (s *deliveryStore) addAccepted(ctx context.Context, job deliveryJob) error 
 }
 
 func (s *deliveryStore) claim(ctx context.Context, now int64) (deliveryJob, bool, error) {
-	row := s.db.QueryRowContext(ctx, `UPDATE deliveries SET state='delivering',attempts=attempts+1,updated_at=? WHERE object_id=(SELECT object_id FROM deliveries WHERE state IN ('pending','retry_wait') AND next_attempt_at<=? ORDER BY accepted_at,object_id LIMIT 1) RETURNING object_id,project,filename,accepted_at,state,attempts,next_attempt_at,last_error,remote_id,updated_at,delivered_at`, now, now)
+	row := s.db.QueryRowContext(ctx, `UPDATE deliveries SET state='delivering',attempts=attempts+1,updated_at=? WHERE object_id=(SELECT object_id FROM deliveries WHERE state IN ('pending','retry_wait') AND next_attempt_at<=? ORDER BY accepted_at,object_id LIMIT 1) RETURNING `+deliveryColumns, now, now)
 	job, err := scanDelivery(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return deliveryJob{}, false, nil
@@ -97,9 +109,37 @@ func (s *deliveryStore) claim(ctx context.Context, now int64) (deliveryJob, bool
 	return job, err == nil, err
 }
 
-func (s *deliveryStore) markDelivered(ctx context.Context, objectID, remoteID string, now int64) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE deliveries SET state='delivered',next_attempt_at=0,remote_id=?,last_error=NULL,updated_at=?,delivered_at=? WHERE object_id=? AND state='delivering'`, remoteID, now, now, objectID)
+func (s *deliveryStore) markDelivered(ctx context.Context, objectID string, result deliveryResult, deliveredAt, purgeAfter int64) error {
+	dbResult, err := s.db.ExecContext(ctx, `UPDATE deliveries SET state='delivered',next_attempt_at=0,remote_id=?,remote_name=?,last_error=NULL,updated_at=?,delivered_at=?,purge_after=?,next_purge_attempt_at=? WHERE object_id=? AND state='delivering'`, result.RemoteID, result.RemoteName, deliveredAt, deliveredAt, purgeAfter, purgeAfter, objectID)
+	return exactlyOne(dbResult, err)
+}
+
+func (s *deliveryStore) nextPurge(ctx context.Context, now int64) (deliveryJob, bool, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries WHERE state='delivered' AND purged_at IS NULL AND next_purge_attempt_at<=? ORDER BY next_purge_attempt_at,object_id LIMIT 1`, now)
+	job, err := scanDelivery(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return deliveryJob{}, false, nil
+	}
+	return job, err == nil, err
+}
+
+func (s *deliveryStore) markPurged(ctx context.Context, objectID string, now int64) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE deliveries SET purged_at=?,next_purge_attempt_at=NULL,last_error=NULL,updated_at=? WHERE object_id=? AND state='delivered' AND purged_at IS NULL`, now, now, objectID)
 	return exactlyOne(result, err)
+}
+
+func (s *deliveryStore) markPurgeRetry(ctx context.Context, objectID, message string, retryAt, now int64) error {
+	if len(message) > 4096 {
+		message = message[:4096]
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE deliveries SET next_purge_attempt_at=?,last_error=?,updated_at=? WHERE object_id=? AND state='delivered' AND purged_at IS NULL`, retryAt, message, now, objectID)
+	return exactlyOne(result, err)
+}
+
+func (s *deliveryStore) hasObject(ctx context.Context, objectID string) (bool, error) {
+	var exists int
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM deliveries WHERE object_id=?)`, objectID).Scan(&exists)
+	return exists == 1, err
 }
 
 func (s *deliveryStore) markRetry(ctx context.Context, objectID, message string, nextAttempt, now int64) error {
@@ -130,12 +170,12 @@ type rowScanner interface {
 
 func scanDelivery(row rowScanner) (deliveryJob, error) {
 	var job deliveryJob
-	err := row.Scan(&job.ObjectID, &job.Project, &job.Filename, &job.AcceptedAt, &job.State, &job.Attempts, &job.NextAttempt, &job.LastError, &job.RemoteID, &job.UpdatedAt, &job.DeliveredAt)
+	err := row.Scan(&job.ObjectID, &job.Project, &job.Filename, &job.AcceptedAt, &job.State, &job.Attempts, &job.NextAttempt, &job.LastError, &job.RemoteID, &job.RemoteName, &job.UpdatedAt, &job.DeliveredAt, &job.PurgeAfter, &job.NextPurgeAt, &job.PurgedAt)
 	return job, err
 }
 
 func (s *deliveryStore) list(ctx context.Context) ([]deliveryJob, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT object_id,project,filename,accepted_at,state,attempts,next_attempt_at,last_error,remote_id,updated_at,delivered_at FROM deliveries ORDER BY accepted_at,object_id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries ORDER BY accepted_at,object_id`)
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +192,7 @@ func (s *deliveryStore) list(ctx context.Context) ([]deliveryJob, error) {
 }
 
 type artifactSink interface {
-	deliver(context.Context, deliveryJob, string) (string, error)
+	deliver(context.Context, deliveryJob, string) (deliveryResult, error)
 }
 
 type sinkFactory func(project string, cfg deliveryConfig) (artifactSink, error)
@@ -200,7 +240,17 @@ func runDelivery(ctx context.Context, cfg runtimeConfig) error {
 			}
 			nextReconcile = worker.now().Add(deliveryReconcileInterval)
 		}
-		worked, err := worker.runCycle(ctx)
+		worked, err := worker.runPurgeCycle(ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return err
+		}
+		if worked {
+			continue
+		}
+		worked, err = worker.runCycle(ctx)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return nil
@@ -252,13 +302,16 @@ func (w *deliveryWorker) runCycle(ctx context.Context) (bool, error) {
 		var sink artifactSink
 		sink, err = w.newSink(job.Project, *projectCfg.Delivery)
 		if err == nil {
-			var remoteID string
-			remoteID, err = sink.deliver(ctx, job, filepath.Join(w.uploadsDir, job.ObjectID))
+			var result deliveryResult
+			result, err = sink.deliver(ctx, job, filepath.Join(w.uploadsDir, job.ObjectID))
 			if err == nil {
-				if markErr := w.store.markDelivered(ctx, job.ObjectID, remoteID, w.now().Unix()); markErr != nil {
+				deliveredAt := w.now()
+				purgeAfter := deliveredAt.Add(projectCfg.Delivery.localArtifactRetention)
+				purgeAfterUnix := unixCeil(purgeAfter)
+				if markErr := w.store.markDelivered(ctx, job.ObjectID, result, deliveredAt.Unix(), purgeAfterUnix); markErr != nil {
 					return true, markErr
 				}
-				slog.Info("artifact delivered", "object_id", job.ObjectID, "project", job.Project, "remote_id", remoteID)
+				slog.Info("artifact delivered", "object_id", job.ObjectID, "project", job.Project, "remote_id", result.RemoteID, "remote_name", result.RemoteName, "purge_after", purgeAfterUnix)
 				return true, nil
 			}
 		}
@@ -269,6 +322,57 @@ func (w *deliveryWorker) runCycle(ctx context.Context) (bool, error) {
 	}
 	slog.Error("artifact delivery failed", "object_id", job.ObjectID, "project", job.Project, "attempt", job.Attempts, "retry_at", next, "err", err)
 	return true, nil
+}
+
+func (w *deliveryWorker) runPurgeCycle(ctx context.Context) (bool, error) {
+	now := w.now()
+	job, ok, err := w.store.nextPurge(ctx, now.Unix())
+	if err != nil || !ok {
+		return false, err
+	}
+	if err := purgeUpload(ctx, w.uploadsDir, job.ObjectID); err != nil {
+		retryAt := unixCeil(w.now().Add(time.Minute))
+		if markErr := w.store.markPurgeRetry(ctx, job.ObjectID, err.Error(), retryAt, w.now().Unix()); markErr != nil {
+			return true, markErr
+		}
+		slog.Error("local artifact purge failed", "object_id", job.ObjectID, "project", job.Project, "retry_at", retryAt, "err", err)
+		return true, nil
+	}
+	if err := w.store.markPurged(ctx, job.ObjectID, w.now().Unix()); err != nil {
+		return true, err
+	}
+	slog.Info("local artifact purged", "object_id", job.ObjectID, "project", job.Project)
+	return true, nil
+}
+
+func purgeUpload(ctx context.Context, uploadsDir, objectID string) (err error) {
+	if !identifierPattern.MatchString(objectID) {
+		return fmt.Errorf("invalid artifact object id %q", objectID)
+	}
+	lock, err := filelocker.New(uploadsDir).NewLock(objectID)
+	if err != nil {
+		return err
+	}
+	if err := lock.Lock(ctx, func() {}); err != nil {
+		return err
+	}
+	defer func() {
+		err = errors.Join(err, lock.Unlock())
+	}()
+	for _, suffix := range []string{"", ".info", ".stop"} {
+		if removeErr := os.Remove(filepath.Join(uploadsDir, objectID+suffix)); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return removeErr
+		}
+	}
+	return syncDirectory(uploadsDir)
+}
+
+func unixCeil(value time.Time) int64 {
+	seconds := value.Unix()
+	if value.Nanosecond() != 0 {
+		seconds++
+	}
+	return seconds
 }
 
 func retryDelay(attempt int) time.Duration {
@@ -310,6 +414,13 @@ func (w *deliveryWorker) discoverAccepted(ctx context.Context) error {
 		}
 		if receipt.ObjectID == "" || entry.Name() != receipt.ObjectID+".json" {
 			slog.Error("receipt has mismatched object id", "receipt", entry.Name(), "object_id", receipt.ObjectID)
+			continue
+		}
+		exists, err := w.store.hasObject(ctx, receipt.ObjectID)
+		if err != nil {
+			return err
+		}
+		if exists {
 			continue
 		}
 		upload, err := fileStore.GetUpload(ctx, receipt.ObjectID)

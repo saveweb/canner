@@ -3,14 +3,15 @@
   "issuer": "https://canner.example",
   "data_dir": "./data",
   "max_upload_bytes": 107374182400,
+  "min_free_bytes": 107374182400,
   "projects": {
     "example": {
-      "token_sha256": "replace-with-output-from-canner-hash-token",
       "delivery": {
         "sink": "internet_archive",
         "credentials_file": "/run/secrets/ia.keys",
         "identifier": "saveweb-example-{{DATE}}-{{OBJECT_ID}}",
         "remote_name": "{{FILENAME}}",
+        "local_artifact_retention": "30s",
         "metadata": {
           "collection": ["replace-with-ia-collection"],
           "mediatype": ["web"],

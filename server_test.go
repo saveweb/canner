@@ -2,10 +2,10 @@ package main
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,16 +18,13 @@ import (
 	"github.com/zeebo/blake3"
 )
 
-const testToken = "project-test-token"
-
 func TestUploadReturnsAndPersistsReceipt(t *testing.T) {
 	s := testServer(t)
 	body := []byte("a small artifact\n")
 	checksum := blake3Checksum(body)
-	location := createUpload(t, s, testToken, int64(len(body)), checksum)
+	location := createUpload(t, s, "test", int64(len(body)), checksum)
 
 	request := httptest.NewRequest(http.MethodPatch, location, bytes.NewReader(body))
-	request.Header.Set("Authorization", "Bearer "+testToken)
 	request.Header.Set("Tus-Resumable", "1.0.0")
 	request.Header.Set("Upload-Offset", "0")
 	request.Header.Set("Content-Type", "application/offset+octet-stream")
@@ -57,7 +54,6 @@ func TestUploadReturnsAndPersistsReceipt(t *testing.T) {
 
 	objectID := strings.TrimPrefix(location, "/files/")
 	request = httptest.NewRequest(http.MethodGet, "/api/v1/receipts/"+objectID, nil)
-	request.Header.Set("Authorization", "Bearer "+testToken)
 	response = httptest.NewRecorder()
 	s.handler.ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
@@ -76,7 +72,6 @@ func TestUploadReturnsAndPersistsReceipt(t *testing.T) {
 		t.Fatal(err)
 	}
 	request = httptest.NewRequest(http.MethodGet, "/api/v1/receipts/"+objectID, nil)
-	request.Header.Set("Authorization", "Bearer "+testToken)
 	response = httptest.NewRecorder()
 	restarted.handler.ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
@@ -84,7 +79,6 @@ func TestUploadReturnsAndPersistsReceipt(t *testing.T) {
 	}
 
 	request = httptest.NewRequest(http.MethodDelete, location, nil)
-	request.Header.Set("Authorization", "Bearer "+testToken)
 	request.Header.Set("Tus-Resumable", "1.0.0")
 	response = httptest.NewRecorder()
 	restarted.handler.ServeHTTP(response, request)
@@ -96,9 +90,8 @@ func TestUploadReturnsAndPersistsReceipt(t *testing.T) {
 func TestChecksumMismatchDoesNotIssueReceipt(t *testing.T) {
 	s := testServer(t)
 	body := []byte("content")
-	location := createUpload(t, s, testToken, int64(len(body)), "blake3:"+strings.Repeat("0", 64))
+	location := createUpload(t, s, "test", int64(len(body)), "blake3:"+strings.Repeat("0", 64))
 	request := httptest.NewRequest(http.MethodPatch, location, bytes.NewReader(body))
-	request.Header.Set("Authorization", "Bearer "+testToken)
 	request.Header.Set("Tus-Resumable", "1.0.0")
 	request.Header.Set("Upload-Offset", "0")
 	request.Header.Set("Content-Type", "application/offset+octet-stream")
@@ -112,20 +105,67 @@ func TestChecksumMismatchDoesNotIssueReceipt(t *testing.T) {
 	}
 }
 
-func TestProjectTokenCannotAccessAnotherProjectUpload(t *testing.T) {
+func TestUnknownProjectIsRejected(t *testing.T) {
 	s := testServer(t)
-	sum := sha256.Sum256([]byte("other-token"))
-	s.cfg.Projects["other"] = projectConfig{TokenSHA256: hex.EncodeToString(sum[:])}
 	body := []byte("content")
-	checksum := blake3Checksum(body)
-	location := createUpload(t, s, testToken, int64(len(body)), checksum)
-	request := httptest.NewRequest(http.MethodHead, location, nil)
-	request.Header.Set("Authorization", "Bearer other-token")
+	metadata := "project " + base64.StdEncoding.EncodeToString([]byte("unknown")) + ",checksum " + base64.StdEncoding.EncodeToString([]byte(blake3Checksum(body)))
+	request := httptest.NewRequest(http.MethodPost, "/files/", nil)
+	request.Header.Set("Tus-Resumable", "1.0.0")
+	request.Header.Set("Upload-Length", fmtInt(int64(len(body))))
+	request.Header.Set("Upload-Metadata", metadata)
+	response := httptest.NewRecorder()
+	s.handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("POST status = %d, want 400; body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestStorageBackpressureRejectsCreateAndPatch(t *testing.T) {
+	s := testServer(t)
+	s.available = func(string) (uint64, error) { return s.cfg.MinFreeBytes - 1, nil }
+	body := []byte("content")
+	metadata := "project " + base64.StdEncoding.EncodeToString([]byte("test")) + ",checksum " + base64.StdEncoding.EncodeToString([]byte(blake3Checksum(body)))
+	request := httptest.NewRequest(http.MethodPost, "/files/", nil)
+	request.Header.Set("Tus-Resumable", "1.0.0")
+	request.Header.Set("Upload-Length", fmtInt(int64(len(body))))
+	request.Header.Set("Upload-Metadata", metadata)
+	response := httptest.NewRecorder()
+	s.handler.ServeHTTP(response, request)
+	if response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") != backpressureRetrySecs || response.Header().Get("Tus-Resumable") != "1.0.0" {
+		t.Fatalf("backpressured POST = %d, headers = %v", response.Code, response.Header())
+	}
+
+	s.available = func(string) (uint64, error) { return s.cfg.MinFreeBytes, nil }
+	location := createUpload(t, s, "test", int64(len(body)), blake3Checksum(body))
+	s.available = func(string) (uint64, error) { return s.cfg.MinFreeBytes - 1, nil }
+	request = httptest.NewRequest(http.MethodPatch, location, bytes.NewReader(body))
+	request.Header.Set("Tus-Resumable", "1.0.0")
+	request.Header.Set("Upload-Offset", "0")
+	request.Header.Set("Content-Type", "application/offset+octet-stream")
+	response = httptest.NewRecorder()
+	s.handler.ServeHTTP(response, request)
+	if response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") != backpressureRetrySecs {
+		t.Fatalf("backpressured PATCH = %d, headers = %v", response.Code, response.Header())
+	}
+
+	request = httptest.NewRequest(http.MethodHead, location, nil)
+	request.Header.Set("Tus-Resumable", "1.0.0")
+	response = httptest.NewRecorder()
+	s.handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("Upload-Offset") != "0" {
+		t.Fatalf("HEAD during backpressure = %d, offset = %q", response.Code, response.Header().Get("Upload-Offset"))
+	}
+}
+
+func TestStorageBackpressureFailsClosedWhenSpaceIsUnknown(t *testing.T) {
+	s := testServer(t)
+	s.available = func(string) (uint64, error) { return 0, errors.New("statfs failed") }
+	request := httptest.NewRequest(http.MethodPost, "/files/", nil)
 	request.Header.Set("Tus-Resumable", "1.0.0")
 	response := httptest.NewRecorder()
 	s.handler.ServeHTTP(response, request)
-	if response.Code != http.StatusNotFound {
-		t.Fatalf("HEAD status = %d, want 404", response.Code)
+	if response.Code != http.StatusServiceUnavailable || response.Header().Get("Retry-After") != backpressureRetrySecs {
+		t.Fatalf("POST with unknown free space = %d, headers = %v", response.Code, response.Header())
 	}
 }
 
@@ -142,18 +182,16 @@ func testServer(t *testing.T) *server {
 
 func testConfig(t *testing.T) runtimeConfig {
 	t.Helper()
-	tokenHash := sha256.Sum256([]byte(testToken))
 	return runtimeConfig{config: config{
-		Issuer: "https://canner.example", DataDir: t.TempDir(), MaxUploadBytes: 1 << 20,
-		Projects: map[string]projectConfig{"test": {TokenSHA256: hex.EncodeToString(tokenHash[:])}},
+		Issuer: "https://canner.example", DataDir: t.TempDir(), MaxUploadBytes: 1 << 20, MinFreeBytes: 1,
+		Projects: map[string]projectConfig{"test": {}},
 	}}
 }
 
-func createUpload(t *testing.T, s *server, token string, size int64, checksum string) string {
+func createUpload(t *testing.T, s *server, project string, size int64, checksum string) string {
 	t.Helper()
-	metadata := "checksum " + base64.StdEncoding.EncodeToString([]byte(checksum))
+	metadata := "project " + base64.StdEncoding.EncodeToString([]byte(project)) + ",checksum " + base64.StdEncoding.EncodeToString([]byte(checksum))
 	request := httptest.NewRequest(http.MethodPost, "/files/", nil)
-	request.Header.Set("Authorization", "Bearer "+token)
 	request.Header.Set("Tus-Resumable", "1.0.0")
 	request.Header.Set("Upload-Length", fmtInt(size))
 	request.Header.Set("Upload-Metadata", metadata)

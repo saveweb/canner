@@ -19,9 +19,13 @@ import (
 	"github.com/tus/tusd/v2/pkg/filestore"
 	tusd "github.com/tus/tusd/v2/pkg/handler"
 	"github.com/zeebo/blake3"
+	"golang.org/x/sys/unix"
 )
 
-const receiptHeader = "Artifact-Receipt"
+const (
+	receiptHeader         = "Artifact-Receipt"
+	backpressureRetrySecs = "60"
+)
 
 type server struct {
 	cfg           runtimeConfig
@@ -31,6 +35,7 @@ type server struct {
 	receiptDir    string
 	handler       http.Handler
 	now           func() time.Time
+	available     func(string) (uint64, error)
 }
 
 func newServer(cfg runtimeConfig) (*server, error) {
@@ -49,7 +54,7 @@ func newServer(cfg runtimeConfig) (*server, error) {
 	store.UseIn(composer)
 	locker.UseIn(composer)
 
-	s := &server{cfg: cfg, store: store, uploadsDir: uploadsDir, receiptDir: receiptDir, now: time.Now}
+	s := &server{cfg: cfg, store: store, uploadsDir: uploadsDir, receiptDir: receiptDir, now: time.Now, available: availableBytes}
 	if cfg.hasDelivery() {
 		deliveryStore, deliveryErr := openDeliveryStore(cfg.DataDir)
 		if deliveryErr != nil {
@@ -79,7 +84,7 @@ func newServer(cfg runtimeConfig) (*server, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /api/v1/receipts/{object_id}", s.getReceipt)
-	files := s.authenticateUpload(http.StripPrefix("/files", uploadHandler))
+	files := s.storageBackpressure(http.StripPrefix("/files", uploadHandler))
 	mux.Handle("/files", files)
 	mux.Handle("/files/", files)
 	s.handler = mux
@@ -87,9 +92,12 @@ func newServer(cfg runtimeConfig) (*server, error) {
 }
 
 func (s *server) beforeCreate(hook tusd.HookEvent) (tusd.HTTPResponse, tusd.FileInfoChanges, error) {
-	project, ok := s.authenticateHeader(hook.HTTPRequest.Header)
-	if !ok {
-		return tusd.HTTPResponse{}, tusd.FileInfoChanges{}, tusd.NewError("ERR_UNAUTHORIZED", "invalid bearer token", http.StatusUnauthorized)
+	project := hook.Upload.MetaData["project"]
+	if !identifierPattern.MatchString(project) {
+		return tusd.HTTPResponse{}, tusd.FileInfoChanges{}, tusd.NewError("ERR_INVALID_PROJECT", "Upload-Metadata project is invalid", http.StatusBadRequest)
+	}
+	if _, ok := s.cfg.Projects[project]; !ok {
+		return tusd.HTTPResponse{}, tusd.FileInfoChanges{}, tusd.NewError("ERR_INVALID_PROJECT", "Upload-Metadata project is not configured", http.StatusBadRequest)
 	}
 	if hook.Upload.SizeIsDeferred || hook.Upload.Size < 1 {
 		return tusd.HTTPResponse{}, tusd.FileInfoChanges{}, tusd.NewError("ERR_INVALID_SIZE", "a positive Upload-Length is required", http.StatusBadRequest)
@@ -107,9 +115,8 @@ func (s *server) beforeCreate(hook tusd.HookEvent) (tusd.HTTPResponse, tusd.File
 }
 
 func (s *server) beforeFinish(hook tusd.HookEvent) (tusd.HTTPResponse, error) {
-	project, ok := s.authenticateHeader(hook.HTTPRequest.Header)
-	if !ok || hook.Upload.MetaData["project"] != project {
-		return tusd.HTTPResponse{}, tusd.NewError("ERR_FORBIDDEN", "upload belongs to another project", http.StatusForbidden)
+	if _, ok := s.cfg.Projects[hook.Upload.MetaData["project"]]; !ok {
+		return tusd.HTTPResponse{}, tusd.NewError("ERR_INVALID_PROJECT", "upload project is no longer configured", http.StatusBadRequest)
 	}
 	receipt, err := s.accept(hook.Upload)
 	if err != nil {
@@ -265,55 +272,55 @@ func (s *server) receiptPath(objectID string) string {
 	return filepath.Join(s.receiptDir, objectID+".json")
 }
 
-func (s *server) authenticateUpload(next http.Handler) http.Handler {
+func (s *server) storageBackpressure(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		project, ok := s.authenticateRequest(r)
-		if !ok {
-			writeError(w, http.StatusUnauthorized, "invalid bearer token")
-			return
-		}
-		if objectID := uploadID(r.URL.Path); objectID != "" {
-			upload, err := s.store.GetUpload(r.Context(), objectID)
-			if err == nil {
-				info, infoErr := upload.GetInfo(r.Context())
-				if infoErr != nil || info.MetaData["project"] != project {
-					writeError(w, http.StatusNotFound, "upload not found")
-					return
-				}
+		if r.Method == http.MethodPost || r.Method == http.MethodPatch {
+			available, err := s.available(s.cfg.DataDir)
+			if err != nil {
+				writeBackpressure(w, r, http.StatusServiceUnavailable, "could not determine available storage")
+				return
+			}
+			if available < s.cfg.MinFreeBytes {
+				writeBackpressure(w, r, http.StatusTooManyRequests, "insufficient free storage; retry later")
+				return
 			}
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-func uploadID(path string) string {
-	value := strings.TrimPrefix(path, "/files/")
-	if value == path || value == "" || strings.Contains(value, "/") || !identifierPattern.MatchString(value) {
-		return ""
+func availableBytes(path string) (uint64, error) {
+	var stat unix.Statfs_t
+	if err := unix.Statfs(path, &stat); err != nil {
+		return 0, err
 	}
-	return value
+	if stat.Bsize <= 0 {
+		return 0, fmt.Errorf("filesystem reported invalid block size %d", stat.Bsize)
+	}
+	blockSize := uint64(stat.Bsize)
+	if stat.Bavail > ^uint64(0)/blockSize {
+		return ^uint64(0), nil
+	}
+	return stat.Bavail * blockSize, nil
+}
+
+func writeBackpressure(w http.ResponseWriter, r *http.Request, status int, message string) {
+	w.Header().Set("Retry-After", backpressureRetrySecs)
+	if version := r.Header.Get("Tus-Resumable"); version != "" {
+		w.Header().Set("Tus-Resumable", version)
+	}
+	writeError(w, status, message)
 }
 
 func (s *server) getReceipt(w http.ResponseWriter, r *http.Request) {
-	project, ok := s.authenticateRequest(r)
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "invalid bearer token")
-		return
-	}
 	objectID := r.PathValue("object_id")
-	upload, err := s.store.GetUpload(r.Context(), objectID)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "receipt not found")
-		return
-	}
-	info, err := upload.GetInfo(r.Context())
-	if err != nil || info.MetaData["project"] != project {
-		writeError(w, http.StatusNotFound, "receipt not found")
-		return
-	}
 	receipt, err := s.readReceipt(objectID)
 	if errors.Is(err, os.ErrNotExist) {
-		writeError(w, http.StatusConflict, "upload has not been accepted")
+		if _, uploadErr := s.store.GetUpload(r.Context(), objectID); uploadErr == nil {
+			writeError(w, http.StatusConflict, "upload has not been accepted")
+		} else {
+			writeError(w, http.StatusNotFound, "receipt not found")
+		}
 		return
 	}
 	if err != nil {
@@ -325,18 +332,6 @@ func (s *server) getReceipt(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-}
-
-func (s *server) authenticateHeader(header http.Header) (string, bool) {
-	value := header.Get("Authorization")
-	if !strings.HasPrefix(value, "Bearer ") {
-		return "", false
-	}
-	return s.cfg.authenticate(strings.TrimPrefix(value, "Bearer "))
-}
-
-func (s *server) authenticateRequest(r *http.Request) (string, bool) {
-	return s.authenticateHeader(r.Header)
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

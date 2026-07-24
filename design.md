@@ -10,7 +10,7 @@ worker -> receiver -> canner persistent volume -> receipt -> HQ
                          +-> delivery worker -> final sink
 ```
 
-Version 1 owns upload authentication, resumable storage, content checksum
+Version 1 owns anonymous upload admission, resumable storage, content checksum
 verification, receipt persistence, receipt recovery, and reliable delivery to
 Internet Archive. It does not parse or validate WARC/media formats or expose a
 generic remote queue.
@@ -33,15 +33,31 @@ memory cost proportional to the one content-hash pass required for integrity.
 Once a receipt exists, acceptance is final. A later sink failure belongs to
 canner's delivery state and never reopens the HQ job.
 
-## Identity and authorization
+## Anonymous project selection
 
-Each configured project has one SHA-256 hash of an upload bearer token. The
-clear token is held by workers, not by canner configuration. Token comparison
-is constant-time.
+Uploads and receipt lookups are anonymous. A worker declares a configured
+project ID in tus `Upload-Metadata`; unknown or malformed project IDs are
+rejected before an upload is created. Canner stores that project with the
+upload and uses it to select delivery configuration.
 
-The authenticated project is written into server-controlled tus metadata.
-Every operation on an existing upload checks that metadata, so one project's
-token cannot inspect, resume, terminate, or retrieve another project's upload.
+Anyone who knows an upload object ID can inspect its tus status, resume it, or
+retrieve its receipt. This is an intentional property of the anonymous v1
+protocol; project IDs are routing labels, not credentials.
+
+## Storage back-pressure
+
+Before every upload create (`POST`) and data append (`PATCH`), the receiver
+checks available bytes on the filesystem containing `data_dir`. When available
+space is less than the global `min_free_bytes`, it returns `429 Too Many
+Requests` with `Retry-After: 60`. Equality is allowed. `HEAD`, health checks,
+and receipt queries remain available so workers can observe existing uploads.
+
+If available space cannot be determined, mutating upload requests receive
+`503 Service Unavailable` with the same retry hint. This is deliberately a
+simple request-boundary guard, not a reservation system: concurrent accepted
+requests can consume additional space, so operators should set the threshold
+with enough headroom for expected upload sizes and concurrency. The example
+configuration uses 100 GiB; deployments may choose another positive byte value.
 
 ## Storage
 
@@ -56,8 +72,10 @@ The receipt sidecar is written to a temporary file, synced, renamed, and then
 the receipt directory is synced. Its existence is the acceptance commit point.
 Repeated acceptance returns the existing receipt unchanged.
 
-Operators must back up the whole data directory. Removing accepted artifacts or
-receipts is outside the online API and requires an explicit retention policy.
+Operators must back up the whole data directory. The delivery process removes
+local artifacts according to project retention configuration after successful
+delivery. Removing receipts remains outside the online API and requires an
+explicit metadata retention policy.
 
 ## Delivery queue
 
@@ -94,12 +112,12 @@ the stable project, object ID, accepted filename, and receipt time, so a retry
 resolves to the same destination. IA credentials are mounted only into the
 delivery process.
 
-## 计划中的清理生命周期
+## 清理生命周期
 
-本节描述尚未实现的清理机制。目标是让本地 artifact 占用保持在存储容量以内，
-同时在 HQ 仍然引用 receipt 时保留可查询的 delivery 证据。Delivery 是否成功、
-本地 payload 是否存在，以及 HQ 是否仍然引用 receipt，是三个相互独立的状态，
-不能合并成一个状态字段。
+本地 payload 清理已经实现；HQ release 和 metadata ledger 仍是未来设计。目标是
+让本地 artifact 占用保持在存储容量以内，同时在 HQ 仍然引用 receipt 时保留
+可查询的 delivery 证据。Delivery 是否成功、本地 payload 是否存在，以及 HQ
+是否仍然引用 receipt，是三个相互独立的状态，不能合并成一个状态字段。
 
 完整时序如下：
 
@@ -186,7 +204,7 @@ retention 到期；最后幂等删除 artifact 和 tus metadata，并写入 `pur
 Payload 清理不需要等待 HQ。HQ 只参与 receipt/metadata 的最终释放：HQ 确认
 artifact 已 delivered 后，在删除或归档 Job 的同一个事务中写入 outbox 事件；
 outbox 幂等通知 canner，canner 再写入 `released_at`。在此之前，canner 必须
-继续提供 receipt 和 delivery 状态查询。
+继续提供 receipt 和 delivery 状态查询。这一段尚未实现。
 
 Receipt 和 delivery 记录本身也不能永久堆积。如果要求不损失历史信息，canner
 应将已 release 的最小记录按日或按月写入压缩的 append-only ledger，例如
@@ -207,9 +225,10 @@ Receipt 和 delivery 记录本身也不能永久堆积。如果要求不损失�
          |                           | 删除 SQLite 历史行       |
 ```
 
-在实现 payload 清理之前，receipt 查询必须先解除对 tus `.info` 的依赖，认证所需
-的 project 应来自保留下来的 receipt/delivery index。清理策略的配置名称、默认值、
-最小 retention 和最大 retention 仍待确定，本设计不预设具体秒数范围。
+Receipt 查询已经解除对 tus `.info` 的依赖：receipt sidecar 保留期间，匿名查询
+可以直接按 object ID 读取它。每个启用 delivery 的 project 必须显式配置
+`local_artifact_retention`；它采用 Go duration 格式，最小值为一秒，不设置固定
+最大值。到期清理失败时一分钟后重试。
 
 ## Receipt contract
 
@@ -236,11 +255,15 @@ BLAKE3.
 ## Failure behavior
 
 - An interrupted upload remains resumable through tus.
+- Low available storage returns `429` for upload creation and continuation;
+  workers should honor `Retry-After` and retry later.
 - A checksum mismatch returns `422` and never writes a receipt.
 - A storage or sync failure returns `500` and never writes a receipt.
 - Losing the final HTTP response is harmless because the worker can retrieve
   the immutable receipt by object ID.
 - Canner restart recovery uses tus metadata and receipt sidecars; no in-memory
   acceptance state is authoritative.
-- Delivery database loss is recoverable by rescanning receipt sidecars.
+- Before payload cleanup, delivery database loss is recoverable by rescanning
+  receipt sidecars and tus metadata. After cleanup, the database contains the
+  retained project and remote-location evidence and must be included in backups.
 - Sink failures persist their error and next retry time without affecting HQ.
