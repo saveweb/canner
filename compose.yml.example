@@ -1,9 +1,21 @@
+x-canner: &canner
+  build: .
+  image: saveweb-canner:local
+  restart: unless-stopped
+  volumes:
+    - ./config.json:/app/config.json:ro
+    - ./data/canner:/app/data
+
 services:
-  canner:
-    build: .
-    restart: unless-stopped
+  receiver:
+    <<: *canner
     ports:
       - "127.0.0.1:8080:8080"
+
+  deliver:
+    <<: *canner
+    command: ["deliver", "/app/config.json"]
     volumes:
       - ./config.json:/app/config.json:ro
+      - ./ia.keys:/run/secrets/ia.keys:ro
       - ./data/canner:/app/data

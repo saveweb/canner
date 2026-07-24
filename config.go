@@ -26,11 +26,29 @@ type config struct {
 }
 
 type projectConfig struct {
-	TokenSHA256 string `json:"token_sha256"`
+	TokenSHA256 string          `json:"token_sha256"`
+	Delivery    *deliveryConfig `json:"delivery,omitempty"`
+}
+
+type deliveryConfig struct {
+	Sink            string              `json:"sink"`
+	CredentialsFile string              `json:"credentials_file"`
+	Identifier      string              `json:"identifier"`
+	RemoteName      string              `json:"remote_name,omitempty"`
+	Metadata        map[string][]string `json:"metadata"`
 }
 
 type runtimeConfig struct {
 	config
+}
+
+func (cfg runtimeConfig) hasDelivery() bool {
+	for _, project := range cfg.Projects {
+		if project.Delivery != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func loadConfig(path string) (runtimeConfig, error) {
@@ -55,6 +73,14 @@ func loadConfig(path string) (runtimeConfig, error) {
 	for project, projectCfg := range cfg.Projects {
 		if !identifierPattern.MatchString(project) || !digestPattern.MatchString(projectCfg.TokenSHA256) {
 			return runtimeConfig{}, fmt.Errorf("project %q has an invalid id or token_sha256", project)
+		}
+		if delivery := projectCfg.Delivery; delivery != nil {
+			if delivery.Sink != "internet_archive" || delivery.CredentialsFile == "" || delivery.Identifier == "" {
+				return runtimeConfig{}, fmt.Errorf("project %q delivery requires sink internet_archive, credentials_file, and identifier", project)
+			}
+			if delivery.RemoteName == "" {
+				delivery.RemoteName = "{{FILENAME}}"
+			}
 		}
 	}
 	return runtimeConfig{config: cfg}, nil

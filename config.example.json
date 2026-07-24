@@ -5,7 +5,18 @@
   "max_upload_bytes": 107374182400,
   "projects": {
     "example": {
-      "token_sha256": "replace-with-output-from-canner-hash-token"
+      "token_sha256": "replace-with-output-from-canner-hash-token",
+      "delivery": {
+        "sink": "internet_archive",
+        "credentials_file": "/run/secrets/ia.keys",
+        "identifier": "saveweb-example-{{DATE}}-{{OBJECT_ID}}",
+        "remote_name": "{{FILENAME}}",
+        "metadata": {
+          "collection": ["replace-with-ia-collection"],
+          "mediatype": ["web"],
+          "title": ["Saveweb example artifact {{OBJECT_ID}}"]
+        }
+      }
     }
   }
 }

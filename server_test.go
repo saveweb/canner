@@ -131,17 +131,22 @@ func TestProjectTokenCannotAccessAnotherProjectUpload(t *testing.T) {
 
 func testServer(t *testing.T) *server {
 	t.Helper()
-	tokenHash := sha256.Sum256([]byte(testToken))
-	cfg := runtimeConfig{config: config{
-		Issuer: "https://canner.example", DataDir: t.TempDir(), MaxUploadBytes: 1 << 20,
-		Projects: map[string]projectConfig{"test": {TokenSHA256: hex.EncodeToString(tokenHash[:])}},
-	}}
+	cfg := testConfig(t)
 	s, err := newServer(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	s.now = func() time.Time { return time.Unix(123456789, 0) }
 	return s
+}
+
+func testConfig(t *testing.T) runtimeConfig {
+	t.Helper()
+	tokenHash := sha256.Sum256([]byte(testToken))
+	return runtimeConfig{config: config{
+		Issuer: "https://canner.example", DataDir: t.TempDir(), MaxUploadBytes: 1 << 20,
+		Projects: map[string]projectConfig{"test": {TokenSHA256: hex.EncodeToString(tokenHash[:])}},
+	}}
 }
 
 func createUpload(t *testing.T, s *server, token string, size int64, checksum string) string {
