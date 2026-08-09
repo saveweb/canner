@@ -19,7 +19,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: canner {serve|deliver|deliveries} <config.json>")
+		return fmt.Errorf("usage: canner {serve|deliver|packages} <config.json>")
 	}
 	switch args[0] {
 	case "serve":
@@ -47,15 +47,15 @@ func run(args []string) error {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		return runDelivery(ctx, cfg)
-	case "deliveries":
+	case "packages":
 		if len(args) != 2 {
-			return fmt.Errorf("usage: canner deliveries <config.json>")
+			return fmt.Errorf("usage: canner packages <config.json>")
 		}
 		cfg, err := loadConfig(args[1])
 		if err != nil {
 			return err
 		}
-		return printDeliveries(context.Background(), cfg, os.Stdout)
+		return printPackages(context.Background(), cfg, os.Stdout)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}

@@ -6,11 +6,17 @@
   "min_free_bytes": 107374182400,
   "projects": {
     "example": {
+      "packaging": {
+        "type": "mergewarc",
+        "trigger_bytes": 10737418240,
+        "target_package_bytes": 1073741824,
+        "max_wait": "24h"
+      },
       "delivery": {
         "sink": "internet_archive",
         "credentials_file": "/run/secrets/ia.keys",
-        "identifier": "saveweb-example-{{DATE}}-{{OBJECT_ID}}",
-        "remote_name": "{{FILENAME}}",
+        "identifier": "saveweb-example-{{DATE}}-{{PACKAGE_ID}}",
+        "remote_name": "{{PACKAGE_FILENAME}}",
         "local_artifact_retention": "30s",
         "metadata": {
           "collection": ["replace-with-ia-collection"],

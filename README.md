@@ -1,9 +1,9 @@
 # canner
 
 `canner` accepts artifacts from Saveweb workers, returns receipts for SavewebHQ
-job completions, and delivers accepted artifacts to their final sink. Upload
-receiving and delivery are separate processes sharing one persistent data
-directory.
+job completions, packages accepted artifacts, and delivers packages to their
+final sink. Upload receiving and packaging/delivery are separate processes
+sharing one persistent data directory.
 
 A receipt means only that canner has synced the file, checked its declared
 content checksum, and durably stored the receipt. It does not mean that
@@ -78,20 +78,66 @@ client also exposes `Receipt` for explicit receipt recovery by object ID.
 
 ## Delivery
 
-Each project may configure an `internet_archive` delivery sink. The credentials
+Each project configures an `internet_archive` delivery sink. The credentials
 file uses the go2internetarchive format: access key on the first line and secret
 key on the second. Canner expands these deterministic templates in the IA
 identifier, remote name, and metadata:
 
 - `{{PROJECT}}`: worker-declared configured canner project;
-- `{{OBJECT_ID}}`: stable tus object ID;
-- `{{FILENAME}}`: safe upload filename, or the object ID when it is unsafe;
-- `{{DATE}}`: receipt acceptance time in UTC `YYYYMMDDhhmmss` form.
+- `{{PACKAGE_ID}}` (and `{{OBJECT_ID}}`): stable package ID;
+- `{{PACKAGE_FILENAME}}` (and `{{FILENAME}}`): package filename;
+- `{{DATE}}`: package creation time in UTC `YYYYMMDDhhmmss` form.
+
+Every project explicitly selects a packager. `identity` creates a one-member
+package whose payload is the original artifact, without transforming or copying
+its bytes:
+
+```json
+"packaging": { "type": "identity" }
+```
+
+Because uploads and packages share `data_dir`, the identity packager publishes
+the payload with a hard link. The normal package lifecycle then applies without
+a separate direct-delivery path.
+
+`mergewarc` aggregates dictionary-free WARC-Zstd artifacts:
+
+```json
+"packaging": {
+  "type": "mergewarc",
+  "trigger_bytes": 10737418240,
+  "target_package_bytes": 1073741824,
+  "max_wait": "24h"
+}
+```
+
+Once unpackaged accepted data reaches `trigger_bytes`, canner starts a durable
+draining round and creates packages no larger than approximately
+`target_package_bytes` until less than one target remains. The tail joins the
+next round; `max_wait` seals an older partial package so low-volume data cannot
+wait forever. An artifact larger than the target forms a package by itself.
+
+Package inputs are ordered by acceptance time and object ID. Canner uses
+`mergewarc` to strictly validate and concatenate their original compressed
+bytes without recompression. It writes and syncs the package and its JSONL
+manifest through temporary files, publishes each with an atomic rename, and
+only seals the package after both are durable. The manifest records each original object ID, receipt ID,
+SHA-1, SHA-256 and BLAKE3 checksums, encoded-byte range, and record count.
+
+The resolved IA identifier, remote names, metadata, sink driver, and
+credential-file reference are persisted as an immutable plan before the first
+attempt. Each IA item receives both the package payload and its manifest.
+Changing project templates affects only packages created afterward.
+
+Acceptance remains checksum-only: a packaging format error does not invalidate
+an artifact receipt or reopen its HQ job. Canner marks the bad artifact and
+continues packaging valid artifacts. Transient build failures retry with the
+same one-minute-to-one-hour backoff used by delivery.
 
 The receiver records accepted artifacts in `data/delivery.sqlite`; `deliver`
-also reconciles immutable receipt sidecars at startup and once per hour so the
-database can recover missing accepted objects before their local files are
-purged. It processes one artifact at a time. A failed attempt enters
+also reconciles immutable receipt sidecars at startup and once per hour. SQLite
+persists package membership and immutable delivery plans and must be backed up
+with the rest of `data_dir`. It processes one package at a time. A failed attempt enters
 `retry_wait`; retries start after one minute and cap at one hour. A restart
 returns an interrupted `delivering` item to `retry_wait`. Delivery never changes
 the receipt or reopens the HQ job.
@@ -101,20 +147,26 @@ file names are URL-encoded while preserving `/` path separators.
 
 `local_artifact_retention` is required for every delivery configuration. It is
 a Go duration of at least one second, such as `"30s"` or `"24h"`, with no fixed
-maximum. After a successful delivery, canner persists the IA identifier, remote
-name, delivery time, and purge deadline. Once the deadline passes, it
-idempotently removes the artifact and tus metadata while retaining the receipt
-and delivery record. Failed purges retry after one minute.
+maximum. After a successful delivery, canner persists the IA identifier,
+delivery time, and purge deadline. Once the deadline passes, it idempotently
+removes the local package payload and manifest while retaining the receipt,
+membership, and delivery record. Failed purges retry after one minute.
+
+Sealing provides a durable, byte-exact package representation, so canner removes
+member upload paths and tus metadata after the package and manifest are synced.
+For `identity`, the package hard link keeps the same inode alive. Canner retains
+the original receipts and package membership.
 
 Run exactly one `deliver` process for a data directory. Inspect delivery state
 as JSONL with:
 
 ```sh
-go run . deliveries config.json
+go run . packages config.json
 ```
 
-The output includes attempts, delivery and purge retry times, last error, final
-IA identifier and remote name, `delivered_at`, and `purged_at`.
+The JSONL output has separate `package` and `delivery` records, including build,
+delivery and purge retry state, blocked format errors, checksums, final IA
+identifier, `delivered_at`, and `purged_at`.
 
 ## Verify
 

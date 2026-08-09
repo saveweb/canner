@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -14,57 +14,33 @@ import (
 
 const deliveryAttemptTimeout = 24 * time.Hour
 
-type internetArchiveSink struct {
-	project   string
-	cfg       deliveryConfig
-	accessKey string
-	secretKey string
-}
-
-type deliveryResult struct {
-	RemoteID   string
-	RemoteName string
-}
-
-func newInternetArchiveSink(project string, cfg deliveryConfig) (artifactSink, error) {
-	accessKey, secretKey, err := utils.ReadKeysFromFile(cfg.CredentialsFile)
+func deliverPackageToInternetArchive(ctx context.Context, plan packageDeliveryPlan, dataDir string) error {
+	if plan.Version != 1 || plan.Sink != "internet_archive" || plan.Identifier == "" || len(plan.Files) == 0 || plan.RetentionNanos < int64(time.Second) {
+		return fmt.Errorf("invalid package delivery plan")
+	}
+	accessKey, secretKey, err := utils.ReadKeysFromFile(plan.CredentialsFile)
 	if err != nil {
-		return nil, fmt.Errorf("read Internet Archive credentials: %w", err)
+		return fmt.Errorf("read Internet Archive credentials: %w", err)
 	}
-	return &internetArchiveSink{project: project, cfg: cfg, accessKey: accessKey, secretKey: secretKey}, nil
-}
-
-func (s *internetArchiveSink) deliver(ctx context.Context, job deliveryJob, localPath string) (deliveryResult, error) {
-	if err := ctx.Err(); err != nil {
-		return deliveryResult{}, err
-	}
-	values := map[string]string{
-		"{{PROJECT}}":   s.project,
-		"{{OBJECT_ID}}": job.ObjectID,
-		"{{FILENAME}}":  job.Filename,
-		"{{DATE}}":      time.Unix(job.AcceptedAt, 0).UTC().Format("20060102150405"),
-	}
-	identifier := resolveDeliveryTemplate(s.cfg.Identifier, values)
-	remoteName := resolveDeliveryTemplate(s.cfg.RemoteName, values)
-	if remoteName == "" || remoteName == "." || strings.Contains(remoteName, `\`) || strings.HasPrefix(remoteName, "/") || strings.HasSuffix(remoteName, "/") || path.Clean(remoteName) != remoteName || strings.HasPrefix(remoteName, "../") {
-		return deliveryResult{}, fmt.Errorf("resolved remote name %q is invalid", remoteName)
-	}
-	metadata := make(map[string][]string, len(s.cfg.Metadata))
-	for key, input := range s.cfg.Metadata {
-		output := make([]string, len(input))
-		for i, value := range input {
-			output[i] = resolveDeliveryTemplate(value, values)
+	files := make(map[string]string, len(plan.Files))
+	for remoteName, relativePath := range plan.Files {
+		if err := validateRemoteName(remoteName); err != nil {
+			return err
 		}
-		metadata[key] = output
+		base := filepath.Base(relativePath)
+		if base != relativePath {
+			return fmt.Errorf("invalid package delivery source %q", relativePath)
+		}
+		dir := "packages"
+		if strings.HasSuffix(relativePath, ".manifest.jsonl") {
+			dir = "package-manifests"
+		}
+		files[remoteName] = filepath.Join(dataDir, dir, relativePath)
 	}
-	files := map[string]string{remoteName: localPath}
 	uploadCtx, cancel := context.WithTimeout(ctx, deliveryAttemptTimeout)
 	defer cancel()
 	client := &http.Client{Timeout: deliveryAttemptTimeout}
-	if err := uploadToInternetArchive(uploadCtx, client, identifier, files, metadata, s.accessKey, s.secretKey); err != nil {
-		return deliveryResult{}, err
-	}
-	return deliveryResult{RemoteID: identifier, RemoteName: remoteName}, nil
+	return uploadToInternetArchive(uploadCtx, client, plan.Identifier, files, plan.Metadata, accessKey, secretKey)
 }
 
 func uploadToInternetArchive(ctx context.Context, client *http.Client, identifier string, files map[string]string, metadata map[string][]string, accessKey, secretKey string) (err error) {
@@ -74,13 +50,4 @@ func uploadToInternetArchive(ctx context.Context, client *http.Client, identifie
 		}
 	}()
 	return upload.UploadContext(ctx, client, identifier, files, metadata, accessKey, secretKey)
-}
-
-func resolveDeliveryTemplate(value string, replacements map[string]string) string {
-	return strings.NewReplacer(
-		"{{PROJECT}}", replacements["{{PROJECT}}"],
-		"{{OBJECT_ID}}", replacements["{{OBJECT_ID}}"],
-		"{{FILENAME}}", replacements["{{FILENAME}}"],
-		"{{DATE}}", replacements["{{DATE}}"],
-	).Replace(value)
 }

@@ -25,7 +25,16 @@ type config struct {
 }
 
 type projectConfig struct {
-	Delivery *deliveryConfig `json:"delivery,omitempty"`
+	Packaging packagingConfig `json:"packaging"`
+	Delivery  deliveryConfig  `json:"delivery"`
+}
+
+type packagingConfig struct {
+	Type               string `json:"type"`
+	TriggerBytes       int64  `json:"trigger_bytes"`
+	TargetPackageBytes int64  `json:"target_package_bytes"`
+	MaxWait            string `json:"max_wait"`
+	maxWait            time.Duration
 }
 
 type deliveryConfig struct {
@@ -40,15 +49,6 @@ type deliveryConfig struct {
 
 type runtimeConfig struct {
 	config
-}
-
-func (cfg runtimeConfig) hasDelivery() bool {
-	for _, project := range cfg.Projects {
-		if project.Delivery != nil {
-			return true
-		}
-	}
-	return false
 }
 
 func loadConfig(path string) (runtimeConfig, error) {
@@ -74,19 +74,33 @@ func loadConfig(path string) (runtimeConfig, error) {
 		if !identifierPattern.MatchString(project) {
 			return runtimeConfig{}, fmt.Errorf("project %q has an invalid id", project)
 		}
-		if delivery := projectCfg.Delivery; delivery != nil {
-			if delivery.Sink != "internet_archive" || delivery.CredentialsFile == "" || delivery.Identifier == "" || delivery.LocalArtifactRetention == "" {
-				return runtimeConfig{}, fmt.Errorf("project %q delivery requires sink internet_archive, credentials_file, identifier, and local_artifact_retention", project)
-			}
-			if delivery.RemoteName == "" {
-				delivery.RemoteName = "{{FILENAME}}"
-			}
-			retention, err := time.ParseDuration(delivery.LocalArtifactRetention)
-			if err != nil || retention < time.Second {
-				return runtimeConfig{}, fmt.Errorf("project %q local_artifact_retention must be a duration of at least 1s", project)
-			}
-			delivery.localArtifactRetention = retention
+		delivery := &projectCfg.Delivery
+		if delivery.Sink != "internet_archive" || delivery.CredentialsFile == "" || delivery.Identifier == "" || delivery.LocalArtifactRetention == "" {
+			return runtimeConfig{}, fmt.Errorf("project %q requires delivery with sink internet_archive, credentials_file, identifier, and local_artifact_retention", project)
 		}
+		if delivery.RemoteName == "" {
+			delivery.RemoteName = "{{PACKAGE_FILENAME}}"
+		}
+		retention, err := time.ParseDuration(delivery.LocalArtifactRetention)
+		if err != nil || retention < time.Second {
+			return runtimeConfig{}, fmt.Errorf("project %q local_artifact_retention must be a duration of at least 1s", project)
+		}
+		delivery.localArtifactRetention = retention
+		packaging := &projectCfg.Packaging
+		if packaging.Type != "identity" && packaging.Type != "mergewarc" {
+			return runtimeConfig{}, fmt.Errorf("project %q requires packaging type identity or mergewarc", project)
+		}
+		if packaging.Type == "mergewarc" {
+			if packaging.TargetPackageBytes < 1 || packaging.TriggerBytes < packaging.TargetPackageBytes {
+				return runtimeConfig{}, fmt.Errorf("project %q packaging requires positive target_package_bytes and trigger_bytes >= target_package_bytes", project)
+			}
+			maxWait, err := time.ParseDuration(packaging.MaxWait)
+			if err != nil || maxWait < time.Second {
+				return runtimeConfig{}, fmt.Errorf("project %q packaging max_wait must be a duration of at least 1s", project)
+			}
+			packaging.maxWait = maxWait
+		}
+		cfg.Projects[project] = projectCfg
 	}
 	return runtimeConfig{config: cfg}, nil
 }

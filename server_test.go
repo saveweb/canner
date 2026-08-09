@@ -195,6 +195,7 @@ func testServer(t *testing.T) *server {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { s.deliveryStore.close() })
 	s.now = func() time.Time { return time.Unix(123456789, 0) }
 	return s
 }

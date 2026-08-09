@@ -55,13 +55,11 @@ func newServer(cfg runtimeConfig) (*server, error) {
 	locker.UseIn(composer)
 
 	s := &server{cfg: cfg, store: store, uploadsDir: uploadsDir, receiptDir: receiptDir, now: time.Now, available: availableBytes}
-	if cfg.hasDelivery() {
-		deliveryStore, deliveryErr := openDeliveryStore(cfg.DataDir)
-		if deliveryErr != nil {
-			slog.Error("open delivery index; startup reconciliation will recover receipts", "err", deliveryErr)
-		} else {
-			s.deliveryStore = deliveryStore
-		}
+	deliveryStore, deliveryErr := openDeliveryStore(cfg.DataDir)
+	if deliveryErr != nil {
+		slog.Error("open delivery index; startup reconciliation will recover receipts", "err", deliveryErr)
+	} else {
+		s.deliveryStore = deliveryStore
 	}
 	uploadHandler, err := tusd.NewHandler(tusd.Config{
 		BasePath:             "/files/",
@@ -144,7 +142,7 @@ func (e *hashMismatchError) Error() string {
 
 func (s *server) accept(info tusd.FileInfo) (artifactReceipt, error) {
 	if receipt, err := s.readReceipt(info.ID); err == nil {
-		s.enqueueDelivery(info, receipt)
+		s.indexArtifact(info, receipt)
 		return receipt, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return artifactReceipt{}, err
@@ -192,22 +190,20 @@ func (s *server) accept(info tusd.FileInfo) (artifactReceipt, error) {
 	if err := s.writeReceipt(receipt); err != nil {
 		return artifactReceipt{}, err
 	}
-	s.enqueueDelivery(info, receipt)
+	s.indexArtifact(info, receipt)
 	return receipt, nil
 }
 
-func (s *server) enqueueDelivery(info tusd.FileInfo, receipt artifactReceipt) {
+func (s *server) indexArtifact(info tusd.FileInfo, receipt artifactReceipt) {
 	if s.deliveryStore == nil {
 		return
 	}
-	job := deliveryJob{
-		ObjectID:   receipt.ObjectID,
-		Project:    info.MetaData["project"],
-		Filename:   safeFilename(info.MetaData["filename"], receipt.ObjectID),
-		AcceptedAt: receipt.AcceptedAt,
-	}
-	if err := s.deliveryStore.addAccepted(context.Background(), job); err != nil {
-		slog.Error("index accepted artifact for delivery; reconciliation will retry", "object_id", receipt.ObjectID, "err", err)
+	if err := s.deliveryStore.addArtifact(context.Background(), artifactRecord{
+		ObjectID: receipt.ObjectID, Project: info.MetaData["project"], Filename: safeFilename(info.MetaData["filename"], receipt.ObjectID),
+		Checksum: receipt.Checksum, SizeBytes: receipt.SizeBytes, AcceptedAt: receipt.AcceptedAt,
+	}); err != nil {
+		slog.Error("index accepted artifact; reconciliation will retry", "object_id", receipt.ObjectID, "err", err)
+		return
 	}
 }
 

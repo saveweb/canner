@@ -38,7 +38,7 @@ func writeTestConfig(t *testing.T, retentionField string) string {
 "data_dir":%q,
 "max_upload_bytes":1024,
 "min_free_bytes":1,
-"projects":{"test":{"delivery":{
+"projects":{"test":{"packaging":{"type":"identity"},"delivery":{
 "sink":"internet_archive","credentials_file":"unused","identifier":"test"%s
 }}}}`, t.TempDir(), retentionField)
 	path := filepath.Join(t.TempDir(), "config.json")
