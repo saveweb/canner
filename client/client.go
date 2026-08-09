@@ -21,6 +21,9 @@ import (
 )
 
 const (
+	// DefaultBaseURL is the public Saveweb Canner receiver.
+	DefaultBaseURL = "https://canner.saveweb.org/"
+
 	tusVersion    = "1.0.0"
 	receiptHeader = "Artifact-Receipt"
 	maxErrorBody  = 64 << 10
@@ -77,8 +80,12 @@ type Client struct {
 	baseURL *url.URL
 }
 
-// New creates a client for a canner receiver base URL.
+// New creates a client for a canner receiver. An empty base URL uses
+// DefaultBaseURL.
 func New(baseURL string) (*Client, error) {
+	if baseURL == "" {
+		baseURL = DefaultBaseURL
+	}
 	parsed, err := url.Parse(baseURL)
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		return nil, fmt.Errorf("canner base URL must be an absolute HTTP URL")

@@ -16,6 +16,16 @@ import (
 	"time"
 )
 
+func TestNewUsesDefaultBaseURL(t *testing.T) {
+	client, err := New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := client.baseURL.String(); got != DefaultBaseURL {
+		t.Fatalf("base URL = %q, want %q", got, DefaultBaseURL)
+	}
+}
+
 func TestUploadCompletesAndReturnsHeaderReceipt(t *testing.T) {
 	content := []byte("artifact content")
 	_, checksum, err := inspectContent(bytes.NewReader(content))

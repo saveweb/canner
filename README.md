@@ -54,7 +54,7 @@ Workers can use the public `github.com/saveweb/canner/client` package instead
 of implementing tus directly:
 
 ```go
-canner, err := client.New("https://canner.example")
+canner, err := client.New("") // defaults to https://canner.saveweb.org/
 if err != nil {
 	return err
 }
@@ -67,6 +67,9 @@ if err != nil {
 `UploadFile` computes BLAKE3, creates the tus upload, resumes from the server's
 current offset, honors `429`/`503` `Retry-After`, and returns the decoded
 receipt. Its retry lifetime is controlled by `ctx`.
+
+Pass an absolute HTTP URL to `New` to override the default receiver, for example
+when using a self-hosted canner instance or a test server.
 
 For recovery across worker restarts, call `Create`, persist the returned
 JSON-compatible `client.Session`, and call `Resume` with the unchanged artifact.
