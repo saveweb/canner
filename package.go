@@ -274,11 +274,14 @@ func packageFilename(project, packageID, packager, artifactFilename string) stri
 
 func makePackageDeliveryPlan(project, packageID, filename, manifestFilename string, createdAt time.Time, cfg deliveryConfig) (packageDeliveryPlan, error) {
 	values := map[string]string{
-		"{{PROJECT}}": project, "{{OBJECT_ID}}": packageID, "{{PACKAGE_ID}}": packageID,
+		"{{PROJECT}}": project, "{{OBJECT_ID}}": packageID, "{{PACKAGE_ID}}": packageID, "{{PACKAGE_ID_SHORT}}": packageID[:24],
 		"{{FILENAME}}": filename, "{{PACKAGE_FILENAME}}": filename,
 		"{{DATE}}": createdAt.UTC().Format("20060102150405"),
 	}
 	identifier := resolvePackageTemplate(cfg.Identifier, values)
+	if err := validateIAIdentifier(identifier); err != nil {
+		return packageDeliveryPlan{}, err
+	}
 	remoteName := resolvePackageTemplate(cfg.RemoteName, values)
 	if err := validateRemoteName(remoteName); err != nil {
 		return packageDeliveryPlan{}, err
@@ -303,6 +306,7 @@ func resolvePackageTemplate(value string, replacements map[string]string) string
 		"{{PROJECT}}", replacements["{{PROJECT}}"],
 		"{{OBJECT_ID}}", replacements["{{OBJECT_ID}}"],
 		"{{PACKAGE_ID}}", replacements["{{PACKAGE_ID}}"],
+		"{{PACKAGE_ID_SHORT}}", replacements["{{PACKAGE_ID_SHORT}}"],
 		"{{FILENAME}}", replacements["{{FILENAME}}"],
 		"{{PACKAGE_FILENAME}}", replacements["{{PACKAGE_FILENAME}}"],
 		"{{DATE}}", replacements["{{DATE}}"],

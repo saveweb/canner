@@ -10,10 +10,18 @@ import (
 )
 
 var (
-	identifierPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
-	digestPattern     = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	checksumPattern   = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}:([0-9a-f]{2}){1,64}$`)
+	identifierPattern   = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
+	iaIdentifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{4,99}$`)
+	digestPattern       = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	checksumPattern     = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}:([0-9a-f]{2}){1,64}$`)
 )
+
+func validateIAIdentifier(identifier string) error {
+	if !iaIdentifierPattern.MatchString(identifier) {
+		return fmt.Errorf("resolved Internet Archive identifier %q must be 5-100 characters, start with an alphanumeric character, and contain only ASCII letters, digits, periods, underscores, or dashes", identifier)
+	}
+	return nil
+}
 
 type config struct {
 	ListenAddr     string                   `json:"listen_addr"`

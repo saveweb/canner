@@ -15,7 +15,7 @@
       "delivery": {
         "sink": "internet_archive",
         "credentials_file": "/run/secrets/ia.keys",
-        "identifier": "saveweb-example-{{DATE}}-{{PACKAGE_ID}}",
+        "identifier": "saveweb-example-{{DATE}}-{{PACKAGE_ID_SHORT}}",
         "remote_name": "{{PACKAGE_FILENAME}}",
         "local_artifact_retention": "30s",
         "metadata": {

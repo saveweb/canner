@@ -85,8 +85,13 @@ identifier, remote name, and metadata:
 
 - `{{PROJECT}}`: worker-declared configured canner project;
 - `{{PACKAGE_ID}}` (and `{{OBJECT_ID}}`): stable package ID;
+- `{{PACKAGE_ID_SHORT}}`: first 24 hexadecimal characters (96 bits) of the stable package ID;
 - `{{PACKAGE_FILENAME}}` (and `{{FILENAME}}`): package filename;
 - `{{DATE}}`: package creation time in UTC `YYYYMMDDhhmmss` form.
+
+Resolved Internet Archive identifiers must be 5-100 characters, start with an
+ASCII letter or digit, and contain only ASCII letters, digits, periods,
+underscores, or dashes.
 
 Every project explicitly selects a packager. `identity` creates a one-member
 package whose payload is the original artifact, without transforming or copying

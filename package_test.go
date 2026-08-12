@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,6 +52,30 @@ func TestIdentityPackagingConfigRequiresNoThresholds(t *testing.T) {
 	}
 	if _, err := loadConfig(path); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPackageDeliveryPlanUsesShortPackageID(t *testing.T) {
+	packageID := strings.Repeat("a", 64)
+	plan, err := makePackageDeliveryPlan("sinavideo", packageID, "package.warc.zst", "package.manifest.jsonl", time.Date(2026, 8, 12, 0, 50, 2, 0, time.UTC), deliveryConfig{
+		Sink: "internet_archive", Identifier: "saveweb_sinavideo_{{DATE}}_{{PACKAGE_ID_SHORT}}", RemoteName: "{{PACKAGE_FILENAME}}",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "saveweb_sinavideo_20260812005002_" + packageID[:24]; plan.Identifier != want {
+		t.Fatalf("identifier = %q, want %q", plan.Identifier, want)
+	}
+}
+
+func TestPackageDeliveryPlanRejectsInvalidIAIdentifier(t *testing.T) {
+	for _, identifier := range []string{"four", "-starts-with-dash", "contains:colon", strings.Repeat("a", 101)} {
+		_, err := makePackageDeliveryPlan("test", strings.Repeat("a", 64), "package", "manifest", time.Unix(0, 0), deliveryConfig{
+			Sink: "internet_archive", Identifier: identifier, RemoteName: "{{PACKAGE_FILENAME}}",
+		})
+		if err == nil {
+			t.Fatalf("accepted invalid IA identifier %q", identifier)
+		}
 	}
 }
 
