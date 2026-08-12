@@ -106,6 +106,30 @@ func TestGoClientUploadsToReceiver(t *testing.T) {
 	}
 }
 
+func TestUploadLocationRespectsForwardedOrigin(t *testing.T) {
+	s := testServer(t)
+	body := []byte("content")
+	metadata := "project " + base64.StdEncoding.EncodeToString([]byte("test")) + ",checksum " + base64.StdEncoding.EncodeToString([]byte(blake3Checksum(body)))
+	request := httptest.NewRequest(http.MethodPost, "/files/", nil)
+	request.Header.Set("Tus-Resumable", "1.0.0")
+	request.Header.Set("Upload-Length", fmtInt(int64(len(body))))
+	request.Header.Set("Upload-Metadata", metadata)
+	request.Header.Set("X-Forwarded-Host", "canner.example")
+	request.Header.Set("X-Forwarded-Proto", "https")
+	response := httptest.NewRecorder()
+	s.handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("POST status = %d, body = %s", response.Code, response.Body.String())
+	}
+	location, err := url.Parse(response.Header().Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if location.Scheme != "https" || location.Host != "canner.example" {
+		t.Fatalf("Location = %q, want https://canner.example/files/...", location)
+	}
+}
+
 func TestChecksumMismatchDoesNotIssueReceipt(t *testing.T) {
 	s := testServer(t)
 	body := []byte("content")

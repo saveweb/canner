@@ -62,12 +62,13 @@ func newServer(cfg runtimeConfig) (*server, error) {
 		s.deliveryStore = deliveryStore
 	}
 	uploadHandler, err := tusd.NewHandler(tusd.Config{
-		BasePath:             "/files/",
-		StoreComposer:        composer,
-		MaxSize:              cfg.MaxUploadBytes,
-		DisableDownload:      true,
-		DisableTermination:   true,
-		DisableConcatenation: true,
+		BasePath:                "/files/",
+		StoreComposer:           composer,
+		MaxSize:                 cfg.MaxUploadBytes,
+		DisableDownload:         true,
+		DisableTermination:      true,
+		DisableConcatenation:    true,
+		RespectForwardedHeaders: true,
 		PreUploadCreateCallback: func(hook tusd.HookEvent) (tusd.HTTPResponse, tusd.FileInfoChanges, error) {
 			return s.beforeCreate(hook)
 		},
