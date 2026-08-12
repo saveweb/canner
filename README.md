@@ -93,6 +93,11 @@ Resolved Internet Archive identifiers must be 5-100 characters, start with an
 ASCII letter or digit, and contain only ASCII letters, digits, periods,
 underscores, or dashes.
 
+The receiver root (`/`) provides a read-only status dashboard. Its htmx fragment
+at `/dashboard/status` refreshes every two seconds and reports active tus
+uploads, unpackaged artifact bytes, package trigger progress, package builds,
+delivery states, and packaging errors for each configured project.
+
 Every project explicitly selects a packager. `identity` creates a one-member
 package whose payload is the original artifact, without transforming or copying
 its bytes:

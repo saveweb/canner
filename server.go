@@ -81,6 +81,8 @@ func newServer(cfg runtimeConfig) (*server, error) {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", s.dashboard)
+	mux.HandleFunc("GET /dashboard/status", s.dashboardStatus)
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /api/v1/receipts/{object_id}", s.getReceipt)
 	files := s.storageBackpressure(http.StripPrefix("/files", uploadHandler))
