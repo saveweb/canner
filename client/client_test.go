@@ -78,6 +78,55 @@ func TestUploadCompletesAndReturnsHeaderReceipt(t *testing.T) {
 	}
 }
 
+func TestUploadReportsHashingAndUploadingProgress(t *testing.T) {
+	content := []byte("artifact content")
+	_, checksum, err := inspectContent(t.Context(), bytes.NewReader(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := Receipt{ID: "receipt:object", ObjectID: "object", Checksum: checksum, SizeBytes: int64(len(content)), AcceptedAt: 123}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			w.Header().Set("Location", "/files/object")
+			w.WriteHeader(http.StatusCreated)
+		case http.MethodHead:
+			w.Header().Set("Upload-Length", strconv.Itoa(len(content)))
+			w.Header().Set("Upload-Offset", "0")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPatch:
+			_, _ = io.Copy(io.Discard, r.Body)
+			raw, _ := json.Marshal(receipt)
+			w.Header().Set(receiptHeader, base64.RawURLEncoding.EncodeToString(raw))
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+	client, _ := New(server.URL)
+
+	var progress []UploadProgress
+	got, err := client.UploadWithProgress(t.Context(), "demo", "artifact", bytes.NewReader(content), func(snapshot UploadProgress) {
+		progress = append(progress, snapshot)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != receipt {
+		t.Fatalf("receipt = %+v, want %+v", got, receipt)
+	}
+	wantStart := UploadProgress{Phase: ProgressHashing, BytesDone: 0, BytesTotal: int64(len(content))}
+	if len(progress) < 4 || progress[0] != wantStart {
+		t.Fatalf("progress starts with %+v, want %+v; all = %+v", progress[0], wantStart, progress)
+	}
+	assertProgressContains(t, progress, UploadProgress{Phase: ProgressHashing, BytesDone: int64(len(content)), BytesTotal: int64(len(content))})
+	assertProgressContains(t, progress, UploadProgress{Phase: ProgressUploading, BytesDone: 0, BytesTotal: int64(len(content))})
+	if got := progress[len(progress)-1]; got != (UploadProgress{Phase: ProgressUploading, BytesDone: int64(len(content)), BytesTotal: int64(len(content))}) {
+		t.Fatalf("final progress = %+v", got)
+	}
+}
+
 func TestResumeUsesRemoteOffsetAndReceiptFallback(t *testing.T) {
 	content := []byte("abcdef")
 	_, checksum, _ := inspectContent(t.Context(), bytes.NewReader(content))
@@ -235,4 +284,14 @@ func decodeMetadata(t *testing.T, value string) map[string]string {
 		metadata[parts[0]] = string(raw)
 	}
 	return metadata
+}
+
+func assertProgressContains(t *testing.T, snapshots []UploadProgress, want UploadProgress) {
+	t.Helper()
+	for _, snapshot := range snapshots {
+		if snapshot == want {
+			return
+		}
+	}
+	t.Fatalf("progress does not contain %+v: %+v", want, snapshots)
 }

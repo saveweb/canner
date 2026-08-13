@@ -51,6 +51,27 @@ type Session struct {
 	Size      int64  `json:"size_bytes"`
 }
 
+// ProgressPhase identifies which part of artifact acceptance is making
+// progress. Uploads hash their content before sending it to the receiver.
+type ProgressPhase string
+
+const (
+	ProgressHashing   ProgressPhase = "hashing"
+	ProgressUploading ProgressPhase = "uploading"
+)
+
+// UploadProgress is a point-in-time snapshot of hashing or upload progress.
+// BytesDone may move backwards during upload recovery when the receiver reports
+// a lower durable offset than the client previously streamed.
+type UploadProgress struct {
+	Phase      ProgressPhase
+	BytesDone  int64
+	BytesTotal int64
+}
+
+// ProgressFunc receives upload progress synchronously. It must return quickly.
+type ProgressFunc func(UploadProgress)
+
 // HTTPError describes a non-successful response from canner.
 type HTTPError struct {
 	StatusCode int
@@ -97,27 +118,42 @@ func New(baseURL string) (*Client, error) {
 
 // UploadFile opens path and uploads it using its base name as metadata.
 func (c *Client) UploadFile(ctx context.Context, project, path string) (Receipt, error) {
+	return c.UploadFileWithProgress(ctx, project, path, nil)
+}
+
+// UploadFileWithProgress opens path and reports hashing and upload progress.
+func (c *Client) UploadFileWithProgress(ctx context.Context, project, path string, progress ProgressFunc) (Receipt, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return Receipt{}, fmt.Errorf("open artifact: %w", err)
 	}
 	defer file.Close()
-	return c.Upload(ctx, project, filepath.Base(path), file)
+	return c.UploadWithProgress(ctx, project, filepath.Base(path), file, progress)
 }
 
 // Upload creates and completes an upload. For recovery across process restarts,
 // call Create, persist the returned Session, and then call Resume.
 func (c *Client) Upload(ctx context.Context, project, filename string, content io.ReadSeeker) (Receipt, error) {
-	session, err := c.Create(ctx, project, filename, content)
+	return c.UploadWithProgress(ctx, project, filename, content, nil)
+}
+
+// UploadWithProgress creates and completes an upload while reporting progress.
+func (c *Client) UploadWithProgress(ctx context.Context, project, filename string, content io.ReadSeeker, progress ProgressFunc) (Receipt, error) {
+	session, err := c.CreateWithProgress(ctx, project, filename, content, progress)
 	if err != nil {
 		return Receipt{}, err
 	}
-	return c.resume(ctx, session, content, false)
+	return c.resume(ctx, session, content, false, progress)
 }
 
 // Create hashes the complete content and creates an empty resumable upload.
 func (c *Client) Create(ctx context.Context, project, filename string, content io.ReadSeeker) (Session, error) {
-	size, checksum, err := inspectContent(ctx, content)
+	return c.CreateWithProgress(ctx, project, filename, content, nil)
+}
+
+// CreateWithProgress hashes content, creates an upload, and reports hashing progress.
+func (c *Client) CreateWithProgress(ctx context.Context, project, filename string, content io.ReadSeeker, progress ProgressFunc) (Session, error) {
+	size, checksum, err := inspectContentWithProgress(ctx, content, progress)
 	if err != nil {
 		return Session{}, err
 	}
@@ -160,15 +196,20 @@ func (c *Client) Create(ctx context.Context, project, filename string, content i
 // Resume verifies content against session and resumes it from the receiver's
 // current offset until a receipt is available.
 func (c *Client) Resume(ctx context.Context, session Session, content io.ReadSeeker) (Receipt, error) {
-	return c.resume(ctx, session, content, true)
+	return c.ResumeWithProgress(ctx, session, content, nil)
 }
 
-func (c *Client) resume(ctx context.Context, session Session, content io.ReadSeeker, verifyContent bool) (Receipt, error) {
+// ResumeWithProgress verifies content and resumes an upload while reporting progress.
+func (c *Client) ResumeWithProgress(ctx context.Context, session Session, content io.ReadSeeker, progress ProgressFunc) (Receipt, error) {
+	return c.resume(ctx, session, content, true, progress)
+}
+
+func (c *Client) resume(ctx context.Context, session Session, content io.ReadSeeker, verifyContent bool, progress ProgressFunc) (Receipt, error) {
 	if err := validateSession(session, c.baseURL); err != nil {
 		return Receipt{}, err
 	}
 	if verifyContent {
-		size, checksum, err := inspectContent(ctx, content)
+		size, checksum, err := inspectContentWithProgress(ctx, content, progress)
 		if err != nil {
 			return Receipt{}, err
 		}
@@ -196,6 +237,7 @@ func (c *Client) resume(ctx context.Context, session Session, content io.ReadSee
 			return Receipt{}, err
 		}
 		if offset == session.Size {
+			reportProgress(progress, ProgressUploading, offset, session.Size)
 			receipt, err := c.Receipt(ctx, session.ObjectID)
 			if err != nil {
 				return Receipt{}, fmt.Errorf("upload is complete but receipt is unavailable: %w", err)
@@ -206,7 +248,14 @@ func (c *Client) resume(ctx context.Context, session Session, content io.ReadSee
 		if _, err := content.Seek(offset, io.SeekStart); err != nil {
 			return Receipt{}, fmt.Errorf("seek artifact to upload offset: %w", err)
 		}
-		body := io.NopCloser(io.LimitReader(content, session.Size-offset))
+		reportProgress(progress, ProgressUploading, offset, session.Size)
+		body := io.NopCloser(io.LimitReader(&progressReader{
+			reader: content,
+			phase:  ProgressUploading,
+			done:   offset,
+			total:  session.Size,
+			report: progress,
+		}, session.Size-offset))
 		req, err := http.NewRequestWithContext(ctx, http.MethodPatch, session.UploadURL, body)
 		if err != nil {
 			return Receipt{}, err
@@ -230,12 +279,14 @@ func (c *Client) resume(ctx context.Context, session Session, content io.ReadSee
 				if err != nil {
 					return Receipt{}, fmt.Errorf("completion response omitted receipt: %w", err)
 				}
+				reportProgress(progress, ProgressUploading, session.Size, session.Size)
 				return receipt, validateReceipt(receipt, session)
 			}
 			receipt, err := decodeReceipt(header)
 			if err != nil {
 				return Receipt{}, err
 			}
+			reportProgress(progress, ProgressUploading, session.Size, session.Size)
 			return receipt, validateReceipt(receipt, session)
 		}
 		httpErr := responseError(response)
@@ -296,6 +347,10 @@ func (c *Client) offset(ctx context.Context, session Session) (int64, error) {
 }
 
 func inspectContent(ctx context.Context, content io.ReadSeeker) (int64, string, error) {
+	return inspectContentWithProgress(ctx, content, nil)
+}
+
+func inspectContentWithProgress(ctx context.Context, content io.ReadSeeker, progress ProgressFunc) (int64, string, error) {
 	if err := context.Cause(ctx); err != nil {
 		return 0, "", err
 	}
@@ -306,8 +361,14 @@ func inspectContent(ctx context.Context, content io.ReadSeeker) (int64, string, 
 	if _, err := content.Seek(0, io.SeekStart); err != nil {
 		return 0, "", fmt.Errorf("seek artifact: %w", err)
 	}
+	reportProgress(progress, ProgressHashing, 0, size)
 	hash := blake3.New()
-	n, err := io.Copy(hash, contextReader{ctx: ctx, reader: content})
+	n, err := io.Copy(hash, contextReader{ctx: ctx, reader: &progressReader{
+		reader: content,
+		phase:  ProgressHashing,
+		total:  size,
+		report: progress,
+	}})
 	if err != nil {
 		return 0, "", fmt.Errorf("hash artifact: %w", err)
 	}
@@ -318,6 +379,29 @@ func inspectContent(ctx context.Context, content io.ReadSeeker) (int64, string, 
 		return 0, "", fmt.Errorf("rewind artifact: %w", err)
 	}
 	return size, "blake3:" + hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+type progressReader struct {
+	reader io.Reader
+	phase  ProgressPhase
+	done   int64
+	total  int64
+	report ProgressFunc
+}
+
+func (r *progressReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	r.done += int64(n)
+	if n > 0 {
+		reportProgress(r.report, r.phase, r.done, r.total)
+	}
+	return n, err
+}
+
+func reportProgress(report ProgressFunc, phase ProgressPhase, done, total int64) {
+	if report != nil {
+		report(UploadProgress{Phase: phase, BytesDone: done, BytesTotal: total})
+	}
 }
 
 type contextReader struct {

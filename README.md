@@ -68,6 +68,12 @@ if err != nil {
 current offset, honors `429`/`503` `Retry-After`, and returns the decoded
 receipt. Its retry lifetime is controlled by `ctx`.
 
+Use `UploadFileWithProgress` when the worker needs progress reporting. Its
+callback receives synchronous `hashing` and `uploading` snapshots with completed
+and total byte counts. The callback must return quickly; callers can retain the
+latest snapshot and publish it at their own logging interval. Upload progress
+may move backwards when recovery discovers a lower durable receiver offset.
+
 Pass an absolute HTTP URL to `New` to override the default receiver, for example
 when using a self-hosted canner instance or a test server.
 
