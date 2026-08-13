@@ -73,6 +73,8 @@ callback receives synchronous `hashing` and `uploading` snapshots with completed
 and total byte counts. The callback must return quickly; callers can retain the
 latest snapshot and publish it at their own logging interval. Upload progress
 may move backwards when recovery discovers a lower durable receiver offset.
+For simple command-line workers, `UploadFileWithProgressToStdout` manages the
+sampling loop itself and prints the latest snapshot at the supplied interval.
 
 Pass an absolute HTTP URL to `New` to override the default receiver, for example
 when using a self-hosted canner instance or a test server.

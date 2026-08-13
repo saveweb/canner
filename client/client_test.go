@@ -127,6 +127,44 @@ func TestUploadReportsHashingAndUploadingProgress(t *testing.T) {
 	}
 }
 
+func TestReportPeriodicProgressUntilStopped(t *testing.T) {
+	var latest atomic.Pointer[UploadProgress]
+	progress := &UploadProgress{Phase: ProgressUploading, BytesDone: 1, BytesTotal: 4}
+	latest.Store(progress)
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	output := &channelWriter{lines: make(chan string, 2)}
+	go func() {
+		reportPeriodicProgress(done, &latest, time.Millisecond, output, "demo", "artifact.warc.zst")
+		close(stopped)
+	}()
+
+	var got string
+	select {
+	case got = <-output.lines:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for progress output")
+	}
+	close(done)
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("progress reporter did not stop")
+	}
+	want := "canner upload progress: project=demo file=artifact.warc.zst phase=uploading bytes=1/4 percent=25.0%\n"
+	if got != want {
+		t.Fatalf("progress output = %q, want line %q", got, want)
+	}
+}
+
+func TestUploadFileWithProgressToStdoutRejectsInvalidInterval(t *testing.T) {
+	client, _ := New("https://canner.example")
+	_, err := client.uploadFileWithPeriodicProgress(t.Context(), "demo", "missing", 0, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "interval must be positive") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestResumeUsesRemoteOffsetAndReceiptFallback(t *testing.T) {
 	content := []byte("abcdef")
 	_, checksum, _ := inspectContent(t.Context(), bytes.NewReader(content))
@@ -294,4 +332,13 @@ func assertProgressContains(t *testing.T, snapshots []UploadProgress, want Uploa
 		}
 	}
 	t.Fatalf("progress does not contain %+v: %+v", want, snapshots)
+}
+
+type channelWriter struct {
+	lines chan string
+}
+
+func (w *channelWriter) Write(p []byte) (int, error) {
+	w.lines <- string(p)
+	return len(p), nil
 }

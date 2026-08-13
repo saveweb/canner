@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zeebo/blake3"
@@ -129,6 +131,57 @@ func (c *Client) UploadFileWithProgress(ctx context.Context, project, path strin
 	}
 	defer file.Close()
 	return c.UploadWithProgress(ctx, project, filepath.Base(path), file, progress)
+}
+
+// UploadFileWithProgressToStdout uploads path and prints the latest hashing or
+// upload progress to stdout at interval. It is intended for workers that only
+// need lightweight human-readable progress reporting.
+func (c *Client) UploadFileWithProgressToStdout(ctx context.Context, project, path string, interval time.Duration) (Receipt, error) {
+	return c.uploadFileWithPeriodicProgress(ctx, project, path, interval, os.Stdout)
+}
+
+func (c *Client) uploadFileWithPeriodicProgress(ctx context.Context, project, path string, interval time.Duration, output io.Writer) (Receipt, error) {
+	if interval <= 0 {
+		return Receipt{}, fmt.Errorf("progress interval must be positive")
+	}
+	var latest atomic.Pointer[UploadProgress]
+	done := make(chan struct{})
+	var reporter sync.WaitGroup
+	reporter.Add(1)
+	go func() {
+		defer reporter.Done()
+		reportPeriodicProgress(done, &latest, interval, output, project, filepath.Base(path))
+	}()
+
+	receipt, err := c.UploadFileWithProgress(ctx, project, path, func(progress UploadProgress) {
+		latest.Store(&progress)
+	})
+	close(done)
+	reporter.Wait()
+	return receipt, err
+}
+
+func reportPeriodicProgress(done <-chan struct{}, latest *atomic.Pointer[UploadProgress], interval time.Duration, output io.Writer, project, filename string) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if progress := latest.Load(); progress != nil {
+				fmt.Fprintf(output, "canner upload progress: project=%s file=%s phase=%s bytes=%d/%d percent=%.1f%%\n",
+					project, filename, progress.Phase, progress.BytesDone, progress.BytesTotal, progressPercent(*progress))
+			}
+		case <-done:
+			return
+		}
+	}
+}
+
+func progressPercent(progress UploadProgress) float64 {
+	if progress.BytesTotal <= 0 {
+		return 0
+	}
+	return float64(progress.BytesDone) * 100 / float64(progress.BytesTotal)
 }
 
 // Upload creates and completes an upload. For recovery across process restarts,
