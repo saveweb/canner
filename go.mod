@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	github.com/gofrs/flock v0.12.1
 	github.com/klauspost/compress v1.18.6
-	github.com/saveweb/go2internetarchive v0.1.5-0.20260723055940-0d4a3b69d5b5
+	github.com/saveweb/go2internetarchive v0.1.5-0.20260812200722-eca3ae479b55
 	github.com/saveweb/mergewarc v0.0.0-20260730233022-8ab7882d106a
 	github.com/tus/tusd/v2 v2.10.0
 	github.com/zeebo/blake3 v0.2.4

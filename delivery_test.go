@@ -42,8 +42,71 @@ func TestOpenDeliveryStoreReplacesLegacyArtifactDeliveryIndex(t *testing.T) {
 		}
 		columns[name] = true
 	}
-	if !columns["package_id"] || !columns["sink_id"] || columns["object_id"] {
+	if !columns["package_id"] || !columns["sink_id"] || !columns["progress"] || columns["object_id"] {
 		t.Fatalf("delivery columns after migration = %v", columns)
+	}
+}
+
+func TestOpenDeliveryStoreAddsProgressToCurrentSchema(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(dir, "delivery.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE deliveries(package_id TEXT NOT NULL,sink_id TEXT NOT NULL,state TEXT NOT NULL,plan TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,next_attempt_at INTEGER NOT NULL,last_error TEXT,remote_id TEXT,updated_at INTEGER NOT NULL,delivered_at INTEGER,PRIMARY KEY(package_id,sink_id)) STRICT`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := openDeliveryStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.close()
+	var count int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('deliveries') WHERE name='progress'`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("progress columns = %d, %v", count, err)
+	}
+}
+
+func TestOpenDeliveryStoreAddsProgressDuringConcurrentStartup(t *testing.T) {
+	dir := t.TempDir()
+	store, err := openDeliveryStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`ALTER TABLE deliveries DROP COLUMN progress`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.close(); err != nil {
+		t.Fatal(err)
+	}
+	first := make(chan error, 1)
+	second := make(chan error, 1)
+	open := func(result chan<- error) {
+		store, err := openDeliveryStore(dir)
+		if err == nil {
+			err = store.close()
+		}
+		result <- err
+	}
+	go open(first)
+	go open(second)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-second; err != nil {
+		t.Fatal(err)
+	}
+	store, err = openDeliveryStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.close()
+	var count int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('deliveries') WHERE name='progress'`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("progress columns = %d, %v", count, err)
 	}
 }
 

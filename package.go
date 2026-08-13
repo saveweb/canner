@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/saveweb/go2internetarchive/pkg/upload"
 	"github.com/saveweb/mergewarc"
 	"github.com/zeebo/blake3"
 )
@@ -66,6 +68,7 @@ type deliveryRecord struct {
 	NextAttempt int64   `json:"next_attempt_at"`
 	LastError   *string `json:"last_error,omitempty"`
 	RemoteID    *string `json:"remote_id,omitempty"`
+	Progress    *string `json:"progress,omitempty"`
 	UpdatedAt   int64   `json:"updated_at"`
 	DeliveredAt *int64  `json:"delivered_at,omitempty"`
 }
@@ -110,7 +113,7 @@ func (s *deliveryStore) artifact(ctx context.Context, objectID string) (artifact
 }
 
 func (s *deliveryStore) recoverInterruptedDeliveries(ctx context.Context, now int64) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE deliveries SET state='retry_wait',next_attempt_at=?,last_error='delivery process stopped before recording an outcome',updated_at=? WHERE state='delivering'`, now, now)
+	_, err := s.db.ExecContext(ctx, `UPDATE deliveries SET state='retry_wait',next_attempt_at=?,last_error='delivery process stopped before recording an outcome',progress=NULL,updated_at=? WHERE state='delivering'`, now, now)
 	return err
 }
 
@@ -676,16 +679,16 @@ func (w *deliveryWorker) runPackagedSourcePurgeCycle(ctx context.Context) (bool,
 	return true, w.store.markSourcePurged(ctx, item.ObjectID, w.now().Unix())
 }
 
-const deliveryColumns = `package_id,sink_id,state,plan,attempts,next_attempt_at,last_error,remote_id,updated_at,delivered_at`
+const deliveryColumns = `package_id,sink_id,state,plan,attempts,next_attempt_at,last_error,remote_id,progress,updated_at,delivered_at`
 
 func scanDelivery(row rowScanner) (deliveryRecord, error) {
 	var delivery deliveryRecord
-	err := row.Scan(&delivery.PackageID, &delivery.SinkID, &delivery.State, &delivery.Plan, &delivery.Attempts, &delivery.NextAttempt, &delivery.LastError, &delivery.RemoteID, &delivery.UpdatedAt, &delivery.DeliveredAt)
+	err := row.Scan(&delivery.PackageID, &delivery.SinkID, &delivery.State, &delivery.Plan, &delivery.Attempts, &delivery.NextAttempt, &delivery.LastError, &delivery.RemoteID, &delivery.Progress, &delivery.UpdatedAt, &delivery.DeliveredAt)
 	return delivery, err
 }
 
 func (s *deliveryStore) claimPackageDelivery(ctx context.Context, now int64) (deliveryRecord, bool, error) {
-	row := s.db.QueryRowContext(ctx, `UPDATE deliveries SET state='delivering',attempts=attempts+1,updated_at=? WHERE (package_id,sink_id)=(SELECT d.package_id,d.sink_id FROM deliveries d JOIN packages p ON p.package_id=d.package_id WHERE p.state='sealed' AND d.state IN ('pending','retry_wait') AND d.next_attempt_at<=? ORDER BY p.created_at,d.package_id,d.sink_id LIMIT 1) RETURNING `+deliveryColumns, now, now)
+	row := s.db.QueryRowContext(ctx, `UPDATE deliveries SET state='delivering',attempts=attempts+1,progress=NULL,updated_at=? WHERE (package_id,sink_id)=(SELECT d.package_id,d.sink_id FROM deliveries d JOIN packages p ON p.package_id=d.package_id WHERE p.state='sealed' AND d.state IN ('pending','retry_wait') AND d.next_attempt_at<=? ORDER BY p.created_at,d.package_id,d.sink_id LIMIT 1) RETURNING `+deliveryColumns, now, now)
 	delivery, err := scanDelivery(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return deliveryRecord{}, false, nil
@@ -699,7 +702,7 @@ func (s *deliveryStore) markPackageDelivered(ctx context.Context, packageID, sin
 		return err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE deliveries SET state='delivered',next_attempt_at=0,remote_id=?,last_error=NULL,updated_at=?,delivered_at=? WHERE package_id=? AND sink_id=? AND state='delivering'`, remoteID, deliveredAt, deliveredAt, packageID, sinkID)
+	result, err := tx.ExecContext(ctx, `UPDATE deliveries SET state='delivered',next_attempt_at=0,remote_id=?,last_error=NULL,progress=NULL,updated_at=?,delivered_at=? WHERE package_id=? AND sink_id=? AND state='delivering'`, remoteID, deliveredAt, deliveredAt, packageID, sinkID)
 	if err := exactlyOne(result, err); err != nil {
 		return err
 	}
@@ -713,7 +716,16 @@ func (s *deliveryStore) markPackageRetry(ctx context.Context, packageID, sinkID,
 	if len(message) > 4096 {
 		message = message[:4096]
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE deliveries SET state='retry_wait',next_attempt_at=?,last_error=?,updated_at=? WHERE package_id=? AND sink_id=? AND state='delivering'`, retryAt, message, now, packageID, sinkID)
+	result, err := s.db.ExecContext(ctx, `UPDATE deliveries SET state='retry_wait',next_attempt_at=?,last_error=?,progress=NULL,updated_at=? WHERE package_id=? AND sink_id=? AND state='delivering'`, retryAt, message, now, packageID, sinkID)
+	return exactlyOne(result, err)
+}
+
+func (s *deliveryStore) markPackageDeliveryProgress(ctx context.Context, packageID, sinkID string, progress upload.Progress, now int64) error {
+	raw, err := json.Marshal(progress)
+	if err != nil {
+		return err
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE deliveries SET progress=?,updated_at=? WHERE package_id=? AND sink_id=? AND state='delivering'`, string(raw), now, packageID, sinkID)
 	return exactlyOne(result, err)
 }
 
@@ -725,7 +737,18 @@ func (w *deliveryWorker) runPackageDeliveryCycle(ctx context.Context) (bool, err
 	var plan packageDeliveryPlan
 	err = json.Unmarshal([]byte(delivery.Plan), &plan)
 	if err == nil {
-		err = w.deliverPackage(ctx, plan, w.cfg.DataDir)
+		progress := make(chan upload.Progress, 1)
+		result := make(chan error, 1)
+		go func() {
+			result <- w.deliverPackage(ctx, plan, w.cfg.DataDir, progress)
+			close(progress)
+		}()
+		for snapshot := range progress {
+			if progressErr := w.store.markPackageDeliveryProgress(ctx, delivery.PackageID, delivery.SinkID, snapshot, w.now().Unix()); progressErr != nil {
+				slog.Warn("record package delivery progress", "package_id", delivery.PackageID, "sink_id", delivery.SinkID, "err", progressErr)
+			}
+		}
+		err = <-result
 	}
 	if err == nil {
 		deliveredAt := w.now()

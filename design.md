@@ -96,6 +96,11 @@ Delivery attempt 串行执行。失败会以指数退避无限重试，间隔从
 identifier 和远端文件名，go2internetarchive 会在上传前检查远端已有文件。每个
 sink attempt 均可取消，最长执行 24 小时。
 
+`deliver` 进程每秒从 go2internetarchive 接收一次 progress snapshot，并将最新值
+写入 `delivery.sqlite`。独立的 receiver 进程通过同一 SQLite 在 Web UI 展示 IA
+上传字节数、总量、吞吐量、文件数和当前文件；attempt 结束或进程恢复时清除快照，
+避免旧进度被误认为仍在运行。
+
 同一数据目录只能由一个 delivery 进程持有；第二个进程会被进程锁拒绝。SQLite
 使用 WAL，并保存 attempt 次数、下次重试时间、last error、final remote
 identifier 和 delivery 时间，供运维检查。Delivery 成功或失败都不会修改

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+	"github.com/saveweb/go2internetarchive/pkg/upload"
 	"github.com/tus/tusd/v2/pkg/filelocker"
 	"github.com/tus/tusd/v2/pkg/filestore"
 	_ "modernc.org/sqlite"
@@ -36,13 +37,16 @@ func openDeliveryStore(dataDir string) (*deliveryStore, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`PRAGMA busy_timeout=5000`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure delivery database: %w", err)
+	}
 	if err := dropLegacyDeliveries(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate legacy delivery index: %w", err)
 	}
 	for _, statement := range []string{
 		`PRAGMA journal_mode=WAL`,
-		`PRAGMA busy_timeout=5000`,
 		`CREATE TABLE IF NOT EXISTS artifacts (
             object_id TEXT PRIMARY KEY,
             project TEXT NOT NULL,
@@ -106,6 +110,7 @@ func openDeliveryStore(dataDir string) (*deliveryStore, error) {
             next_attempt_at INTEGER NOT NULL,
             last_error TEXT,
             remote_id TEXT,
+			progress TEXT,
             updated_at INTEGER NOT NULL,
             delivered_at INTEGER,
             PRIMARY KEY(package_id,sink_id),
@@ -118,7 +123,50 @@ func openDeliveryStore(dataDir string) (*deliveryStore, error) {
 			return nil, fmt.Errorf("initialize delivery database: %w", err)
 		}
 	}
+	if err := ensureDeliveryProgressColumn(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate delivery progress: %w", err)
+	}
 	return &deliveryStore{db: db}, nil
+}
+
+func ensureDeliveryProgressColumn(db *sql.DB) error {
+	hasColumn, err := deliveryProgressColumnExists(db)
+	if err != nil || hasColumn {
+		return err
+	}
+	if _, err := db.Exec(`ALTER TABLE deliveries ADD COLUMN progress TEXT`); err != nil {
+		// Receiver and deliver can start together against the same database.
+		hasColumn, checkErr := deliveryProgressColumnExists(db)
+		if checkErr == nil && hasColumn {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func deliveryProgressColumnExists(db *sql.DB) (bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(deliveries)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, dataType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if name == "progress" {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func dropLegacyDeliveries(db *sql.DB) error {
@@ -175,7 +223,7 @@ type deliveryWorker struct {
 	cfg            runtimeConfig
 	store          *deliveryStore
 	now            func() time.Time
-	deliverPackage func(context.Context, packageDeliveryPlan, string) error
+	deliverPackage func(context.Context, packageDeliveryPlan, string, chan<- upload.Progress) error
 	uploadsDir     string
 	receiptsDir    string
 }

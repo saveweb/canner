@@ -96,7 +96,10 @@ underscores, or dashes.
 The receiver root (`/`) provides a read-only status dashboard. Its htmx fragment
 at `/dashboard/status` refreshes every two seconds and reports active tus
 uploads, unpackaged artifact bytes, package trigger progress, package builds,
-delivery states, and packaging errors for each configured project.
+delivery states, live Internet Archive upload bytes, throughput and file
+progress, and packaging errors for each configured project. The `deliver`
+process stores its latest progress snapshot in `delivery.sqlite`, so the
+separate receiver process can render it.
 
 Every project explicitly selects a packager. `identity` creates a one-member
 package whose payload is the original artifact, without transforming or copying

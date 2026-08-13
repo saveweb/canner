@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/saveweb/go2internetarchive/pkg/upload"
 	"github.com/saveweb/mergewarc"
 )
 
@@ -168,7 +169,7 @@ func TestPackageDeliveryFailureAndRestartAreRetryable(t *testing.T) {
 	worker := newDeliveryWorker(runtimeConfig{config: config{DataDir: dir}}, store)
 	worker.now = func() time.Time { return time.Unix(100, 0) }
 	wantErr := errors.New("sink unavailable")
-	worker.deliverPackage = func(context.Context, packageDeliveryPlan, string) error { return wantErr }
+	worker.deliverPackage = func(context.Context, packageDeliveryPlan, string, chan<- upload.Progress) error { return wantErr }
 	if worked, err := worker.runPackageDeliveryCycle(t.Context()); err != nil || !worked {
 		t.Fatalf("delivery failure = %v, %v", worked, err)
 	}
@@ -191,6 +192,64 @@ func TestPackageDeliveryFailureAndRestartAreRetryable(t *testing.T) {
 	}
 	if deliveries[0].State != "retry_wait" || deliveries[0].NextAttempt != 200 {
 		t.Fatalf("delivery after restart = %+v", deliveries[0])
+	}
+}
+
+func TestPackageDeliveryPersistsProgressWhileRunning(t *testing.T) {
+	dir := t.TempDir()
+	store, err := openDeliveryStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.close()
+	plan, err := json.Marshal(packageDeliveryPlan{
+		Version: 1, Sink: "internet_archive", CredentialsFile: "unused", Identifier: "item",
+		Files: map[string]string{"package": "package"}, RetentionNanos: int64(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(t.Context(), `INSERT INTO packages(package_id,project,packager,filename,manifest_filename,state,size_bytes,checksum,manifest_checksum,member_count,next_build_at,updated_at,created_at,sealed_at) VALUES('package','test','identity','package','manifest','sealed',100,'blake3:00','blake3:00',1,0,100,100,100)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(t.Context(), `INSERT INTO deliveries(package_id,sink_id,state,plan,next_attempt_at,updated_at) VALUES('package','internet_archive','pending',?,100,100)`, string(plan)); err != nil {
+		t.Fatal(err)
+	}
+	worker := newDeliveryWorker(runtimeConfig{config: config{DataDir: dir}}, store)
+	worker.now = func() time.Time { return time.Unix(100, 0) }
+	progressRecorded := make(chan struct{})
+	finish := make(chan struct{})
+	worker.deliverPackage = func(_ context.Context, _ packageDeliveryPlan, _ string, progress chan<- upload.Progress) error {
+		progress <- upload.Progress{BytesUploaded: 40, TotalBytes: 100, BytesPerSecond: 20, CurrentFile: "package"}
+		close(progressRecorded)
+		<-finish
+		return errors.New("stop after snapshot")
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := worker.runPackageDeliveryCycle(t.Context())
+		result <- err
+	}()
+	<-progressRecorded
+	var raw *string
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+		if err := store.db.QueryRow(`SELECT progress FROM deliveries WHERE package_id='package'`).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		if raw != nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if raw == nil || !strings.Contains(*raw, `"BytesUploaded":40`) {
+		t.Fatalf("progress while running = %v", raw)
+	}
+	close(finish)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT progress FROM deliveries WHERE package_id='package'`).Scan(&raw); err != nil || raw != nil {
+		t.Fatalf("progress after completion = %v, %v", raw, err)
 	}
 }
 
@@ -321,7 +380,7 @@ func TestPackageLifecycle(t *testing.T) {
 	}
 
 	var deliveredPlan packageDeliveryPlan
-	worker.deliverPackage = func(_ context.Context, plan packageDeliveryPlan, _ string) error {
+	worker.deliverPackage = func(_ context.Context, plan packageDeliveryPlan, _ string, _ chan<- upload.Progress) error {
 		deliveredPlan = plan
 		return nil
 	}

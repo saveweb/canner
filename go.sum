@@ -34,8 +34,8 @@ github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec h1:W09IVJc94
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=
 github.com/rivo/uniseg v0.4.7 h1:WUdvkW8uEhrYfLC4ZzdpI2ztxP1I582+49Oc5Mq64VQ=
 github.com/rivo/uniseg v0.4.7/go.mod h1:FN3SvrM+Zdj16jyLfmOkMNblXMcoc8DfTHruCPUcx88=
-github.com/saveweb/go2internetarchive v0.1.5-0.20260723055940-0d4a3b69d5b5 h1:JxatkIDgaGgMYdP41BY9r55IY6Z3e3d+Oux72H5lFuE=
-github.com/saveweb/go2internetarchive v0.1.5-0.20260723055940-0d4a3b69d5b5/go.mod h1:3S81aSR2tOhZ40JWHoDvW88Urjbz+l9t+nvqB8UxEws=
+github.com/saveweb/go2internetarchive v0.1.5-0.20260812200722-eca3ae479b55 h1:OjYXTYWLIfEuYnwgX9cmZmRHvtcSgg7VgEcAAPvSpjc=
+github.com/saveweb/go2internetarchive v0.1.5-0.20260812200722-eca3ae479b55/go.mod h1:3S81aSR2tOhZ40JWHoDvW88Urjbz+l9t+nvqB8UxEws=
 github.com/saveweb/mergewarc v0.0.0-20260730233022-8ab7882d106a h1:jQaUb+OhuOoHhDQgiqSkMoKsLHv6RXMhsWha+yK1qJI=
 github.com/saveweb/mergewarc v0.0.0-20260730233022-8ab7882d106a/go.mod h1:8TG1Saj2RO828sdRD4EfzwUFKADn3mD3NkHWDGCELmQ=
 github.com/saveweb/unwarc v0.0.0-20260715014326-30ffdd449473 h1:EIU2gKH+9IpKd3Smp9et2APYpQlRhVmDh6qIh8HSg7A=
