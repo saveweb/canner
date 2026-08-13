@@ -28,7 +28,7 @@ func TestNewUsesDefaultBaseURL(t *testing.T) {
 
 func TestUploadCompletesAndReturnsHeaderReceipt(t *testing.T) {
 	content := []byte("artifact content")
-	_, checksum, err := inspectContent(bytes.NewReader(content))
+	_, checksum, err := inspectContent(t.Context(), bytes.NewReader(content))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestUploadCompletesAndReturnsHeaderReceipt(t *testing.T) {
 
 func TestResumeUsesRemoteOffsetAndReceiptFallback(t *testing.T) {
 	content := []byte("abcdef")
-	_, checksum, _ := inspectContent(bytes.NewReader(content))
+	_, checksum, _ := inspectContent(t.Context(), bytes.NewReader(content))
 	receipt := Receipt{ID: "receipt:object", ObjectID: "object", Checksum: checksum, SizeBytes: int64(len(content)), AcceptedAt: 123}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -149,7 +149,7 @@ func TestCreateDoesNotRetryAmbiguousTransportFailure(t *testing.T) {
 
 func TestResumeRejectsCrossOriginSession(t *testing.T) {
 	client, _ := New("https://canner.example")
-	_, checksum, _ := inspectContent(bytes.NewReader([]byte("data")))
+	_, checksum, _ := inspectContent(t.Context(), bytes.NewReader([]byte("data")))
 	session := Session{UploadURL: "https://other.example/files/object", ObjectID: "object", Checksum: checksum, Size: 4}
 	_, err := client.Resume(t.Context(), session, bytes.NewReader([]byte("data")))
 	if err == nil || !strings.Contains(err.Error(), "invalid upload session") {
@@ -159,7 +159,7 @@ func TestResumeRejectsCrossOriginSession(t *testing.T) {
 
 func TestResumeRejectsChangedArtifact(t *testing.T) {
 	client, _ := New("https://canner.example")
-	_, checksum, _ := inspectContent(bytes.NewReader([]byte("data")))
+	_, checksum, _ := inspectContent(t.Context(), bytes.NewReader([]byte("data")))
 	session := Session{UploadURL: "https://canner.example/files/object", ObjectID: "object", Checksum: checksum, Size: 4}
 	_, err := client.Resume(t.Context(), session, bytes.NewReader([]byte("edit")))
 	if err == nil || !strings.Contains(err.Error(), "artifact changed") {
@@ -180,6 +180,35 @@ func TestBackpressureWaitHonorsContext(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Create error = %v", err)
 	}
+}
+
+func TestCreateHashingHonorsContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	content := &cancelingReadSeeker{reader: bytes.NewReader(make([]byte, 128<<10)), cancel: cancel}
+	client, _ := New("https://canner.example")
+
+	_, err := client.Create(ctx, "demo", "artifact", content)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Create error = %v, want context.Canceled", err)
+	}
+}
+
+type cancelingReadSeeker struct {
+	reader *bytes.Reader
+	cancel context.CancelFunc
+	reads  int
+}
+
+func (r *cancelingReadSeeker) Read(p []byte) (int, error) {
+	r.reads++
+	if r.reads == 1 {
+		defer r.cancel()
+	}
+	return r.reader.Read(p)
+}
+
+func (r *cancelingReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	return r.reader.Seek(offset, whence)
 }
 
 type failingTransport struct {

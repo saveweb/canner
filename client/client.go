@@ -117,7 +117,7 @@ func (c *Client) Upload(ctx context.Context, project, filename string, content i
 
 // Create hashes the complete content and creates an empty resumable upload.
 func (c *Client) Create(ctx context.Context, project, filename string, content io.ReadSeeker) (Session, error) {
-	size, checksum, err := inspectContent(content)
+	size, checksum, err := inspectContent(ctx, content)
 	if err != nil {
 		return Session{}, err
 	}
@@ -168,7 +168,7 @@ func (c *Client) resume(ctx context.Context, session Session, content io.ReadSee
 		return Receipt{}, err
 	}
 	if verifyContent {
-		size, checksum, err := inspectContent(content)
+		size, checksum, err := inspectContent(ctx, content)
 		if err != nil {
 			return Receipt{}, err
 		}
@@ -295,7 +295,10 @@ func (c *Client) offset(ctx context.Context, session Session) (int64, error) {
 	return offset, nil
 }
 
-func inspectContent(content io.ReadSeeker) (int64, string, error) {
+func inspectContent(ctx context.Context, content io.ReadSeeker) (int64, string, error) {
+	if err := context.Cause(ctx); err != nil {
+		return 0, "", err
+	}
 	size, err := content.Seek(0, io.SeekEnd)
 	if err != nil || size < 1 {
 		return 0, "", fmt.Errorf("artifact must be a non-empty seekable stream")
@@ -304,7 +307,7 @@ func inspectContent(content io.ReadSeeker) (int64, string, error) {
 		return 0, "", fmt.Errorf("seek artifact: %w", err)
 	}
 	hash := blake3.New()
-	n, err := io.Copy(hash, content)
+	n, err := io.Copy(hash, contextReader{ctx: ctx, reader: content})
 	if err != nil {
 		return 0, "", fmt.Errorf("hash artifact: %w", err)
 	}
@@ -315,6 +318,18 @@ func inspectContent(content io.ReadSeeker) (int64, string, error) {
 		return 0, "", fmt.Errorf("rewind artifact: %w", err)
 	}
 	return size, "blake3:" + hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := context.Cause(r.ctx); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
 }
 
 func validateSession(session Session, base *url.URL) error {
