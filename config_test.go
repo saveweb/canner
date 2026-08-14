@@ -20,13 +20,52 @@ func TestLoadConfigParsesLocalArtifactRetention(t *testing.T) {
 	}
 }
 
-func TestLoadConfigDefaultsDeliveryConcurrency(t *testing.T) {
+func TestLoadConfigDefaultsDeliveryConcurrencyToDisabled(t *testing.T) {
 	cfg, err := loadConfig(writeTestConfig(t, `"local_artifact_retention":"24h"`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.DeliveryConcurrency != 2 {
+	if cfg.DeliveryConcurrency != 0 {
 		t.Fatalf("delivery concurrency = %d", cfg.DeliveryConcurrency)
+	}
+}
+
+func TestLoadConfigDefaultsPartialUploadRetention(t *testing.T) {
+	cfg, err := loadConfig(writeTestConfig(t, `"local_artifact_retention":"24h"`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.partialUploadRetention != 30*time.Minute {
+		t.Fatalf("partial upload retention = %s", cfg.partialUploadRetention)
+	}
+}
+
+func TestLoadConfigParsesPartialUploadRetention(t *testing.T) {
+	path := writeTestConfig(t, `"local_artifact_retention":"24h"`)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = []byte(strings.Replace(string(raw), `"min_free_bytes":1`, `"min_free_bytes":1,"partial_upload_retention":"2h"`, 1))
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.partialUploadRetention != 2*time.Hour {
+		t.Fatalf("partial upload retention = %s", cfg.partialUploadRetention)
+	}
+
+	for _, value := range []string{"500ms", "later"} {
+		invalid := []byte(strings.Replace(string(raw), `"partial_upload_retention":"2h"`, `"partial_upload_retention":"`+value+`"`, 1))
+		if err := os.WriteFile(path, invalid, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadConfig(path); err == nil {
+			t.Fatalf("loadConfig accepted partial_upload_retention %q", value)
+		}
 	}
 }
 

@@ -423,6 +423,63 @@ func TestDeliverySchedulerBuildsWhileUploadIsActive(t *testing.T) {
 	}
 }
 
+func TestDeliverySchedulerPackagesWithoutSinkDeliveryAtZeroConcurrency(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.DeliveryConcurrency = 0
+	project := cfg.Projects["test"]
+	project.Packaging = packagingConfig{Type: "identity"}
+	project.Delivery = deliveryConfig{
+		Sink: "internet_archive", CredentialsFile: "unused", Identifier: "identity-{{PACKAGE_ID}}",
+		RemoteName: "{{PACKAGE_FILENAME}}", localArtifactRetention: time.Hour,
+	}
+	cfg.Projects["test"] = project
+	s, err := newServer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.deliveryStore.close()
+	s.now = func() time.Time { return time.Unix(100, 0) }
+	acceptTestArtifact(t, s, []byte("artifact"))
+
+	worker := newDeliveryWorker(cfg, s.deliveryStore)
+	worker.now = s.now
+	deliveryStarted := make(chan struct{}, 1)
+	worker.deliverPackage = func(context.Context, packageDeliveryPlan, string, chan<- upload.Progress) error {
+		deliveryStarted <- struct{}{}
+		return nil
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() { result <- worker.runScheduler(ctx) }()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		var sealed, pending int
+		if err := s.deliveryStore.db.QueryRow(`SELECT COUNT(*) FROM packages WHERE state='sealed'`).Scan(&sealed); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.deliveryStore.db.QueryRow(`SELECT COUNT(*) FROM deliveries WHERE state='pending'`).Scan(&pending); err != nil {
+			t.Fatal(err)
+		}
+		if sealed == 1 && pending == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("packaging with delivery disabled: sealed=%d pending=%d", sealed, pending)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-deliveryStarted:
+		t.Fatal("sink delivery started with zero concurrency")
+	default:
+	}
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func waitForStartedDelivery(t *testing.T, started <-chan string) string {
 	t.Helper()
 	select {

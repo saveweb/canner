@@ -18,46 +18,52 @@ import (
 )
 
 type dashboardProject struct {
-	Name                string
-	PendingArtifacts    int64
-	PendingBytes        int64
-	TriggerBytes        int64
-	BytesUntilTrigger   int64
-	TriggerPercent      int
-	OldestAcceptedAt    int64
-	SecondsUntilMaxWait int64
-	BuildingPackages    int64
-	BlockedPackages     int64
-	PackagingErrors     int64
-	DeliveriesPending   int64
-	DeliveriesActive    int64
-	DeliveriesRetrying  int64
-	DeliveriesDelivered int64
-	DeliveryProgress    bool
-	DeliveryBytes       int64
-	DeliveryTotalBytes  int64
-	DeliveryBytesPerSec int64
-	DeliveryFiles       int
-	DeliveryTotalFiles  int
-	DeliveryCurrentFile string
-	DeliveryPercent     int
-	UploadingArtifacts  int64
-	UploadingBytes      int64
-	UploadingTotalBytes int64
+	Name                  string
+	PendingArtifacts      int64
+	PendingBytes          int64
+	TriggerBytes          int64
+	BytesUntilTrigger     int64
+	TriggerPercent        int
+	OldestAcceptedAt      int64
+	SecondsUntilMaxWait   int64
+	BuildingPackages      int64
+	BlockedPackages       int64
+	PackagingErrors       int64
+	DeliveriesPending     int64
+	DeliveriesActive      int64
+	DeliveriesRetrying    int64
+	DeliveriesDelivered   int64
+	DeliveryProgress      bool
+	DeliveryBytes         int64
+	DeliveryTotalBytes    int64
+	DeliveryBytesPerSec   int64
+	DeliveryFiles         int
+	DeliveryTotalFiles    int
+	DeliveryCurrentFile   string
+	DeliveryPercent       int
+	UploadingArtifacts    int64
+	UploadingBytes        int64
+	UploadingTotalBytes   int64
+	StaleUploads          int64
+	StaleUploadBytes      int64
+	StaleUploadTotalBytes int64
 }
 
 type dashboardView struct {
-	UpdatedAt       time.Time
-	Projects        []dashboardProject
-	UploadingCount  int64
-	BuildingCount   int64
-	DeliveringCount int64
+	UpdatedAt        time.Time
+	Projects         []dashboardProject
+	UploadingCount   int64
+	StaleUploadCount int64
+	BuildingCount    int64
+	DeliveringCount  int64
 }
 
-type activeUpload struct {
+type partialUpload struct {
+	ObjectID string
 	Project  string
 	Received int64
 	Size     int64
+	Stale    bool
 }
 
 func (s *server) dashboard(response http.ResponseWriter, request *http.Request) {
@@ -89,7 +95,7 @@ func (s *server) dashboardView(ctx context.Context) (dashboardView, error) {
 	if err != nil {
 		return dashboardView{}, err
 	}
-	byProject := make(map[string][]activeUpload)
+	byProject := make(map[string][]partialUpload)
 	for _, upload := range uploads {
 		byProject[upload.Project] = append(byProject[upload.Project], upload)
 	}
@@ -105,11 +111,18 @@ func (s *server) dashboardView(ctx context.Context) (dashboardView, error) {
 			return dashboardView{}, err
 		}
 		for _, upload := range byProject[project] {
+			if upload.Stale {
+				projectView.StaleUploads++
+				projectView.StaleUploadBytes += upload.Received
+				projectView.StaleUploadTotalBytes += upload.Size
+				continue
+			}
 			projectView.UploadingArtifacts++
 			projectView.UploadingBytes += upload.Received
 			projectView.UploadingTotalBytes += upload.Size
 		}
 		view.UploadingCount += projectView.UploadingArtifacts
+		view.StaleUploadCount += projectView.StaleUploads
 		view.BuildingCount += projectView.BuildingPackages
 		view.DeliveringCount += projectView.DeliveriesActive
 		view.Projects = append(view.Projects, projectView)
@@ -221,12 +234,12 @@ func (s *deliveryStore) dashboardProject(ctx context.Context, project string, cf
 	return view, rows.Err()
 }
 
-func (s *server) activeUploads() ([]activeUpload, error) {
+func (s *server) activeUploads() ([]partialUpload, error) {
 	entries, err := os.ReadDir(s.uploadsDir)
 	if err != nil {
 		return nil, err
 	}
-	var uploads []activeUpload
+	var uploads []partialUpload
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".info") {
 			continue
@@ -254,7 +267,14 @@ func (s *server) activeUploads() ([]activeUpload, error) {
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return nil, err
 		}
-		uploads = append(uploads, activeUpload{Project: info.MetaData["project"], Received: received, Size: info.Size})
+		lastAttemptEnd, err := s.partialUploadLastAttemptEnd(objectID)
+		if err != nil {
+			return nil, err
+		}
+		uploads = append(uploads, partialUpload{
+			ObjectID: objectID, Project: info.MetaData["project"], Received: received, Size: info.Size,
+			Stale: !s.uploadAttemptActive(objectID) && !lastAttemptEnd.Add(s.cfg.partialUploadRetention).After(s.now()),
+		})
 	}
 	return uploads, nil
 }
@@ -275,7 +295,7 @@ var dashboardPageTemplate = template.Must(template.New("dashboard").Parse(`<!doc
 
 var dashboardStatusTemplate = template.Must(template.New("status").Funcs(template.FuncMap{
 	"bytes": formatBytes, "duration": formatDuration,
-}).Parse(`<div class="summary"><div class="metric"><b class="number">{{.UploadingCount}}</b><span>active uploads</span></div><div class="metric"><b class="number">{{.BuildingCount}}</b><span>packages building</span></div><div class="metric"><b class="number">{{.DeliveringCount}}</b><span>deliveries active</span></div></div><h1>Projects</h1><div class="table-wrap"><table><thead><tr><th>Project</th><th>Artifact backlog</th><th>Next trigger</th><th>Uploading</th><th>Packaging</th><th>Delivery</th><th>Issues</th></tr></thead><tbody>{{range .Projects}}<tr><td class="project">{{.Name}}</td><td><span class="number">{{.PendingArtifacts}}</span> artifacts<br><span class="muted number">{{bytes .PendingBytes}}</span></td><td>{{if eq .TriggerBytes 0}}Immediate{{else}}<span class="number">{{bytes .BytesUntilTrigger}}</span> remaining<progress value="{{.TriggerPercent}}" max="100"></progress><span class="muted">{{if .PendingArtifacts}}or {{duration .SecondsUntilMaxWait}}{{else}}waiting for artifacts{{end}}</span>{{end}}</td><td>{{if .UploadingArtifacts}}<span class="state active"><span class="dot"></span><span class="number">{{.UploadingArtifacts}} active</span></span><br><span class="muted number">{{bytes .UploadingBytes}} / {{bytes .UploadingTotalBytes}}</span>{{else}}<span class="state"><span class="dot"></span>Idle</span>{{end}}</td><td>{{if .BuildingPackages}}<span class="state active"><span class="dot"></span><span class="number">{{.BuildingPackages}} building</span></span>{{else}}<span class="state"><span class="dot"></span>Idle</span>{{end}}</td><td>{{if .DeliveriesActive}}<span class="state active"><span class="dot"></span><span class="number">{{.DeliveriesActive}} uploading</span></span>{{if .DeliveryProgress}}<progress value="{{.DeliveryPercent}}" max="100"></progress><span class="muted number">{{bytes .DeliveryBytes}} / {{bytes .DeliveryTotalBytes}} · {{bytes .DeliveryBytesPerSec}}/s</span><br><span class="muted number">{{.DeliveryFiles}} / {{.DeliveryTotalFiles}} files</span>{{if .DeliveryCurrentFile}}<span class="muted filename">{{.DeliveryCurrentFile}}</span>{{end}}{{else}}<br><span class="muted">Starting...</span>{{end}}{{else}}<span class="state ok"><span class="dot"></span>Idle</span>{{end}}<br><span class="muted number">{{.DeliveriesPending}} pending · {{.DeliveriesRetrying}} retrying · {{.DeliveriesDelivered}} delivered</span></td><td>{{if or .BlockedPackages .PackagingErrors}}<span class="state danger"><span class="dot"></span><span class="number">{{.BlockedPackages}} blocked · {{.PackagingErrors}} artifact errors</span></span>{{else}}<span class="state ok"><span class="dot"></span>None</span>{{end}}</td></tr>{{end}}</tbody></table></div><div class="foot"><span>Auto-refresh every 2 seconds</span><time>{{.UpdatedAt.UTC.Format "2006-01-02 15:04:05 UTC"}}</time></div>`))
+}).Parse(`<div class="summary"><div class="metric"><b class="number">{{.UploadingCount}}</b><span>active uploads</span></div><div class="metric"><b class="number">{{.StaleUploadCount}}</b><span>stale/incomplete</span></div><div class="metric"><b class="number">{{.BuildingCount}}</b><span>packages building</span></div><div class="metric"><b class="number">{{.DeliveringCount}}</b><span>deliveries active</span></div></div><h1>Projects</h1><div class="table-wrap"><table><thead><tr><th>Project</th><th>Artifact backlog</th><th>Next trigger</th><th>Uploading</th><th>Packaging</th><th>Delivery</th><th>Issues</th></tr></thead><tbody>{{range .Projects}}<tr><td class="project">{{.Name}}</td><td><span class="number">{{.PendingArtifacts}}</span> artifacts<br><span class="muted number">{{bytes .PendingBytes}}</span></td><td>{{if eq .TriggerBytes 0}}Immediate{{else}}<span class="number">{{bytes .BytesUntilTrigger}}</span> remaining<progress value="{{.TriggerPercent}}" max="100"></progress><span class="muted">{{if .PendingArtifacts}}or {{duration .SecondsUntilMaxWait}}{{else}}waiting for artifacts{{end}}</span>{{end}}</td><td>{{if .UploadingArtifacts}}<span class="state active"><span class="dot"></span><span class="number">{{.UploadingArtifacts}} active</span></span><br><span class="muted number">{{bytes .UploadingBytes}} / {{bytes .UploadingTotalBytes}}</span>{{else}}<span class="state"><span class="dot"></span>Idle</span>{{end}}{{if .StaleUploads}}<br><span class="state warn"><span class="dot"></span><span class="number">{{.StaleUploads}} stale/incomplete</span></span><br><span class="muted number">{{bytes .StaleUploadBytes}} / {{bytes .StaleUploadTotalBytes}}</span>{{end}}</td><td>{{if .BuildingPackages}}<span class="state active"><span class="dot"></span><span class="number">{{.BuildingPackages}} building</span></span>{{else}}<span class="state"><span class="dot"></span>Idle</span>{{end}}</td><td>{{if .DeliveriesActive}}<span class="state active"><span class="dot"></span><span class="number">{{.DeliveriesActive}} uploading</span></span>{{if .DeliveryProgress}}<progress value="{{.DeliveryPercent}}" max="100"></progress><span class="muted number">{{bytes .DeliveryBytes}} / {{bytes .DeliveryTotalBytes}} · {{bytes .DeliveryBytesPerSec}}/s</span><br><span class="muted number">{{.DeliveryFiles}} / {{.DeliveryTotalFiles}} files</span>{{if .DeliveryCurrentFile}}<span class="muted filename">{{.DeliveryCurrentFile}}</span>{{end}}{{else}}<br><span class="muted">Starting...</span>{{end}}{{else}}<span class="state ok"><span class="dot"></span>Idle</span>{{end}}<br><span class="muted number">{{.DeliveriesPending}} pending · {{.DeliveriesRetrying}} retrying · {{.DeliveriesDelivered}} delivered</span></td><td>{{if or .BlockedPackages .PackagingErrors}}<span class="state danger"><span class="dot"></span><span class="number">{{.BlockedPackages}} blocked · {{.PackagingErrors}} artifact errors</span></span>{{else}}<span class="state ok"><span class="dot"></span>None</span>{{end}}</td></tr>{{end}}</tbody></table></div><div class="foot"><span>Auto-refresh every 2 seconds</span><time>{{.UpdatedAt.UTC.Format "2006-01-02 15:04:05 UTC"}}</time></div>`))
 
 func formatBytes(value int64) string {
 	units := []string{"B", "KiB", "MiB", "GiB", "TiB"}

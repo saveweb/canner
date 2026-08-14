@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tus/tusd/v2/pkg/filelocker"
@@ -28,17 +29,25 @@ const (
 )
 
 type server struct {
-	cfg           runtimeConfig
-	store         filestore.FileStore
-	deliveryStore *deliveryStore
-	uploadsDir    string
-	receiptDir    string
-	handler       http.Handler
-	now           func() time.Time
-	available     func(string) (uint64, error)
+	cfg            runtimeConfig
+	store          filestore.FileStore
+	locker         filelocker.FileLocker
+	deliveryStore  *deliveryStore
+	uploadsDir     string
+	receiptDir     string
+	handler        http.Handler
+	now            func() time.Time
+	available      func(string) (uint64, error)
+	activeMu       sync.RWMutex
+	activeAttempts map[string]int
+	cleanupStop    chan struct{}
+	cleanupDone    chan struct{}
 }
 
 func newServer(cfg runtimeConfig) (*server, error) {
+	if cfg.partialUploadRetention == 0 {
+		cfg.partialUploadRetention = 30 * time.Minute
+	}
 	uploadsDir := filepath.Join(cfg.DataDir, "uploads")
 	receiptDir := filepath.Join(cfg.DataDir, "receipts")
 	for _, dir := range []string{uploadsDir, receiptDir} {
@@ -54,7 +63,11 @@ func newServer(cfg runtimeConfig) (*server, error) {
 	store.UseIn(composer)
 	locker.UseIn(composer)
 
-	s := &server{cfg: cfg, store: store, uploadsDir: uploadsDir, receiptDir: receiptDir, now: time.Now, available: availableBytes}
+	s := &server{
+		cfg: cfg, store: store, locker: locker, uploadsDir: uploadsDir, receiptDir: receiptDir,
+		now: time.Now, available: availableBytes, activeAttempts: make(map[string]int),
+		cleanupStop: make(chan struct{}), cleanupDone: make(chan struct{}),
+	}
 	deliveryStore, deliveryErr := openDeliveryStore(cfg.DataDir)
 	if deliveryErr != nil {
 		slog.Error("open delivery index; startup reconciliation will recover receipts", "err", deliveryErr)
@@ -85,11 +98,21 @@ func newServer(cfg runtimeConfig) (*server, error) {
 	mux.HandleFunc("GET /dashboard/status", s.dashboardStatus)
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /api/v1/receipts/{object_id}", s.getReceipt)
-	files := s.storageBackpressure(http.StripPrefix("/files", uploadHandler))
+	files := s.trackUploadAttempts(s.storageBackpressure(http.StripPrefix("/files", uploadHandler)))
 	mux.Handle("/files", files)
 	mux.Handle("/files/", files)
 	s.handler = mux
 	return s, nil
+}
+
+func (s *server) close() {
+	select {
+	case <-s.cleanupStop:
+		return
+	default:
+		close(s.cleanupStop)
+		<-s.cleanupDone
+	}
 }
 
 func (s *server) beforeCreate(hook tusd.HookEvent) (tusd.HTTPResponse, tusd.FileInfoChanges, error) {

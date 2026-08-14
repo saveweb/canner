@@ -32,6 +32,13 @@ project <configured project id>,checksum blake3:<64 lowercase hex characters>
 Before accepting a create or patch request, canner checks the filesystem
 containing `data_dir`. If available space is below the configurable
 `min_free_bytes`, it returns `429 Too Many Requests` with `Retry-After: 60`.
+
+Incomplete uploads are active while a PATCH request is running and remain
+resumable for `partial_upload_retention` after the most recent PATCH attempt
+ends. The default is `30m`. The dashboard reports older sessions as
+`stale/incomplete`; the receiver periodically removes their data and tus
+metadata. Existing sessions created before this tracking was introduced use
+the last stored data modification time as their final-attempt fallback.
 The example configuration uses 100 GiB. Status (`HEAD`) and receipt requests
 remain available while uploads are paused.
 
@@ -159,8 +166,9 @@ The receiver records accepted artifacts in `data/delivery.sqlite`; `deliver`
 also reconciles immutable receipt sidecars at startup and once per hour. SQLite
 persists package membership and immutable delivery plans and must be backed up
 with the rest of `data_dir`. `delivery_concurrency` bounds simultaneous sink
-uploads and defaults to `2`; packaging, cleanup, claiming, progress, and terminal
-state updates remain serialized through the scheduler. A failed attempt enters
+uploads. A value of `0`, including when the field is omitted, disables sink
+delivery while packaging continues. Packaging, cleanup, claiming, progress,
+and terminal state updates remain serialized through the scheduler. A failed attempt enters
 `retry_wait`; retries start after one minute and cap at one hour. A restart
 returns interrupted `delivering` items to `retry_wait`. Delivery never changes
 the receipt or reopens the HQ job.

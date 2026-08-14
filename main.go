@@ -34,6 +34,8 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+		server.startPartialUploadCleanup()
+		defer server.close()
 		slog.Info("listening", "addr", cfg.ListenAddr, "issuer", cfg.Issuer)
 		return http.ListenAndServe(cfg.ListenAddr, server.handler)
 	case "deliver":

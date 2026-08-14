@@ -4,6 +4,7 @@
   "data_dir": "./data",
   "max_upload_bytes": 107374182400,
   "min_free_bytes": 107374182400,
+  "partial_upload_retention": "30m",
   "delivery_concurrency": 2,
   "projects": {
     "example": {
