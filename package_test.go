@@ -162,6 +162,9 @@ func TestIdentityPackageUsesOriginalArtifactBytes(t *testing.T) {
 	}
 	sourcePath := filepath.Join(cfg.DataDir, "uploads", members[0].ObjectID)
 	packagePath := filepath.Join(cfg.DataDir, "packages", pkg.Filename)
+	if _, err := os.Stat(filepath.Join(cfg.DataDir, "packages", packageDirectoryAnchor)); err != nil {
+		t.Fatalf("package directory anchor: %v", err)
+	}
 	sourceInfo, err := os.Stat(sourcePath)
 	if err != nil {
 		t.Fatal(err)

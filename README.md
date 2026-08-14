@@ -129,6 +129,9 @@ packages are on the same filesystem. If `packages` is a separate mount, it
 copies the payload into the package temporary file instead. The normal package
 lifecycle then applies without a separate direct-delivery path.
 
+Canner retains a `.canner-keep` file in `packages` so remote filesystems do not
+remove the directory as empty while a large temporary package is still open.
+
 `mergewarc` aggregates dictionary-free WARC-Zstd artifacts:
 
 ```json

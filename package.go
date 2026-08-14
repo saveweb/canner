@@ -60,6 +60,8 @@ type packageRecord struct {
 	PurgedAt         *int64  `json:"purged_at,omitempty"`
 }
 
+const packageDirectoryAnchor = ".canner-keep"
+
 type deliveryRecord struct {
 	PackageID   string  `json:"package_id"`
 	SinkID      string  `json:"sink_id"`
@@ -485,6 +487,9 @@ func (w *deliveryWorker) materializePackage(ctx context.Context, pkg packageReco
 			return err
 		}
 	}
+	if err := ensurePackageDirectory(packageDir); err != nil {
+		return err
+	}
 	if pkg.Packager == "identity" {
 		return w.materializeIdentityPackage(ctx, pkg, members, packageDir, manifestDir)
 	}
@@ -552,6 +557,24 @@ func (w *deliveryWorker) materializePackage(ctx context.Context, pkg packageReco
 	manifestChecksum := "blake3:" + hex.EncodeToString(manifestHash.Sum(nil))
 	if err := w.store.sealPackage(ctx, pkg.PackageID, manifest.Output.Size, packageChecksum, manifestChecksum, w.now().Unix()); err != nil {
 		return err
+	}
+	return nil
+}
+
+func ensurePackageDirectory(path string) error {
+	anchor, err := os.OpenFile(filepath.Join(path, packageDirectoryAnchor), os.O_WRONLY|os.O_CREATE, 0o640)
+	if err != nil {
+		return fmt.Errorf("create package directory anchor: %w", err)
+	}
+	if err := anchor.Sync(); err != nil {
+		anchor.Close()
+		return fmt.Errorf("sync package directory anchor: %w", err)
+	}
+	if err := anchor.Close(); err != nil {
+		return fmt.Errorf("close package directory anchor: %w", err)
+	}
+	if err := syncDirectory(path); err != nil {
+		return fmt.Errorf("sync package directory: %w", err)
 	}
 	return nil
 }
