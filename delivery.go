@@ -307,16 +307,14 @@ func (w *deliveryWorker) runScheduler(ctx context.Context) error {
 			nextReconcile = w.now().Add(deliveryReconcileInterval)
 		}
 
-		if active == 0 {
-			worked, err := w.runPackageBuildCycle(ctx)
-			if err != nil {
-				return stop(err)
-			}
-			if worked {
-				continue
-			}
+		worked, err := w.runPackageBuildCycle(ctx)
+		if err != nil {
+			return stop(err)
 		}
-		worked, err := w.runPackagedSourcePurgeCycle(ctx)
+		if worked {
+			continue
+		}
+		worked, err = w.runPackagedSourcePurgeCycle(ctx)
 		if err != nil {
 			return stop(err)
 		}

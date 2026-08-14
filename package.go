@@ -688,7 +688,7 @@ func scanDelivery(row rowScanner) (deliveryRecord, error) {
 }
 
 func (s *deliveryStore) claimPackageDelivery(ctx context.Context, now int64) (deliveryRecord, bool, error) {
-	row := s.db.QueryRowContext(ctx, `UPDATE deliveries SET state='delivering',attempts=attempts+1,progress=NULL,updated_at=? WHERE (package_id,sink_id)=(SELECT d.package_id,d.sink_id FROM deliveries d JOIN packages p ON p.package_id=d.package_id WHERE p.state='sealed' AND d.state IN ('pending','retry_wait') AND d.next_attempt_at<=? ORDER BY p.created_at,d.package_id,d.sink_id LIMIT 1) RETURNING `+deliveryColumns, now, now)
+	row := s.db.QueryRowContext(ctx, `UPDATE deliveries SET state='delivering',attempts=attempts+1,progress=NULL,updated_at=? WHERE (package_id,sink_id)=(SELECT d.package_id,d.sink_id FROM deliveries d JOIN packages p ON p.package_id=d.package_id WHERE p.state='sealed' AND d.state IN ('pending','retry_wait') AND d.next_attempt_at<=? ORDER BY CASE d.state WHEN 'pending' THEN 0 ELSE 1 END,p.created_at,d.package_id,d.sink_id LIMIT 1) RETURNING `+deliveryColumns, now, now)
 	delivery, err := scanDelivery(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return deliveryRecord{}, false, nil

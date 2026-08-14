@@ -195,6 +195,37 @@ func TestPackageDeliveryFailureAndRestartAreRetryable(t *testing.T) {
 	}
 }
 
+func TestClaimPackageDeliveryPrefersPendingOverRetry(t *testing.T) {
+	store, err := openDeliveryStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.close()
+	for _, delivery := range []struct {
+		packageID string
+		state     string
+		createdAt int
+	}{
+		{packageID: "old-retry", state: "retry_wait", createdAt: 1},
+		{packageID: "new-pending", state: "pending", createdAt: 2},
+	} {
+		if _, err := store.db.ExecContext(t.Context(), `INSERT INTO packages(package_id,project,packager,filename,manifest_filename,state,size_bytes,checksum,manifest_checksum,member_count,next_build_at,updated_at,created_at,sealed_at) VALUES(?,'test','identity',?,?,'sealed',1,'blake3:00','blake3:00',1,0,?,?,?)`, delivery.packageID, delivery.packageID, delivery.packageID+".manifest", delivery.createdAt, delivery.createdAt, delivery.createdAt); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.db.ExecContext(t.Context(), `INSERT INTO deliveries(package_id,sink_id,state,plan,next_attempt_at,updated_at) VALUES(?,'internet_archive',?, '{}',0,?)`, delivery.packageID, delivery.state, delivery.createdAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	delivery, ok, err := store.claimPackageDelivery(t.Context(), 100)
+	if err != nil || !ok {
+		t.Fatalf("claim delivery = %+v, %v, %v", delivery, ok, err)
+	}
+	if delivery.PackageID != "new-pending" {
+		t.Fatalf("claimed %q before fresh pending delivery", delivery.PackageID)
+	}
+}
+
 func TestPackageDeliveryPersistsProgressWhileRunning(t *testing.T) {
 	dir := t.TempDir()
 	store, err := openDeliveryStore(dir)
@@ -331,6 +362,64 @@ func TestDeliverySchedulerBoundsConcurrencyAndRecoversCancellation(t *testing.T)
 	}
 	if retrying != 2 {
 		t.Fatalf("recovered deliveries = %d", retrying)
+	}
+}
+
+func TestDeliverySchedulerBuildsWhileUploadIsActive(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.DeliveryConcurrency = 1
+	project := cfg.Projects["test"]
+	project.Packaging = packagingConfig{Type: "identity"}
+	project.Delivery = deliveryConfig{
+		Sink: "internet_archive", CredentialsFile: "unused", Identifier: "identity-{{PACKAGE_ID}}",
+		RemoteName: "{{PACKAGE_FILENAME}}", localArtifactRetention: time.Hour,
+	}
+	cfg.Projects["test"] = project
+	s, err := newServer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.deliveryStore.close()
+	s.now = func() time.Time { return time.Unix(100, 0) }
+
+	acceptTestArtifact(t, s, []byte("first"))
+	worker := newDeliveryWorker(cfg, s.deliveryStore)
+	worker.now = s.now
+	if worked, err := worker.runPackageBuildCycle(t.Context()); err != nil || !worked {
+		t.Fatalf("initial package build = %v, %v", worked, err)
+	}
+
+	started := make(chan chan<- upload.Progress, 1)
+	worker.deliverPackage = func(ctx context.Context, _ packageDeliveryPlan, _ string, progress chan<- upload.Progress) error {
+		started <- progress
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() { result <- worker.runScheduler(ctx) }()
+	progress := <-started
+
+	acceptTestArtifact(t, s, []byte("second"))
+	progress <- upload.Progress{}
+	deadline := time.Now().Add(time.Second)
+	for {
+		var packages int
+		if err := s.deliveryStore.db.QueryRow(`SELECT COUNT(*) FROM packages WHERE state='sealed'`).Scan(&packages); err != nil {
+			t.Fatal(err)
+		}
+		if packages == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("new package was not built while an upload was active")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatal(err)
 	}
 }
 
