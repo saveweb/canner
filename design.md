@@ -159,6 +159,11 @@ credentials-file reference。Plan 一经写入不再读取可变模板，因此 
 仍指向同一 IA item。一个 Package 对应一个 IA item，item 同时包含 payload 和
 `.manifest.jsonl`；`mergewarc` payload 使用 `.warc.zst`。
 
+`deliver` 由单个 scheduler 串行执行 package claim、SQLite progress/state 更新、
+packaging 和 cleanup，同时以 bounded goroutine 并发执行 sink 网络上传；并发上限由
+顶层 `delivery_concurrency` 配置，缺省为 `2`。shutdown 取消所有 active upload，
+未完成的 `delivering` row 在下次启动时恢复为 `retry_wait`。
+
 Package sealed 后，manifest 的 byte range 可以精确恢复每个原始 Artifact，Canner
 因此可以删除 member payload 和 tus metadata，同时保留原始 receipt、Artifact row
 和 package membership。Package delivery 成功并经过 `local_artifact_retention` 后，

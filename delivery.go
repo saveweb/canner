@@ -255,59 +255,112 @@ func runDelivery(ctx context.Context, cfg runtimeConfig) error {
 	if err := worker.discoverAccepted(ctx); err != nil {
 		return fmt.Errorf("discover accepted artifacts: %w", err)
 	}
-	nextReconcile := worker.now().Add(deliveryReconcileInterval)
+	return worker.runScheduler(ctx)
+}
+
+func (w *deliveryWorker) runScheduler(ctx context.Context) error {
+	uploadCtx, cancelUploads := context.WithCancel(ctx)
+	defer cancelUploads()
+	events := make(chan packageDeliveryEvent, w.cfg.DeliveryConcurrency*2)
+	active := 0
+	stop := func(runErr error) error {
+		cancelUploads()
+		for active > 0 {
+			event := <-events
+			if event.done {
+				active--
+			}
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		return runErr
+	}
+	handleEvent := func(event packageDeliveryEvent) error {
+		if event.done {
+			active--
+		}
+		return w.handlePackageDeliveryEvent(ctx, event)
+	}
+	nextReconcile := w.now().Add(deliveryReconcileInterval)
 	for {
-		if !worker.now().Before(nextReconcile) {
-			if err := worker.discoverAccepted(ctx); err != nil {
-				return fmt.Errorf("reconcile accepted artifacts: %w", err)
-			}
-			nextReconcile = worker.now().Add(deliveryReconcileInterval)
+		if ctx.Err() != nil {
+			return stop(nil)
 		}
-		worked, err := worker.runPackageBuildCycle(ctx)
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				return nil
+
+	drainEvents:
+		for {
+			select {
+			case event := <-events:
+				if err := handleEvent(event); err != nil {
+					return stop(err)
+				}
+			default:
+				break drainEvents
 			}
-			return err
+		}
+
+		if !w.now().Before(nextReconcile) {
+			if err := w.discoverAccepted(ctx); err != nil {
+				return stop(fmt.Errorf("reconcile accepted artifacts: %w", err))
+			}
+			nextReconcile = w.now().Add(deliveryReconcileInterval)
+		}
+
+		if active == 0 {
+			worked, err := w.runPackageBuildCycle(ctx)
+			if err != nil {
+				return stop(err)
+			}
+			if worked {
+				continue
+			}
+		}
+		worked, err := w.runPackagedSourcePurgeCycle(ctx)
+		if err != nil {
+			return stop(err)
 		}
 		if worked {
 			continue
 		}
-		worked, err = worker.runPackagedSourcePurgeCycle(ctx)
+		worked, err = w.runPackagePurgeCycle(ctx)
 		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				return nil
-			}
-			return err
+			return stop(err)
 		}
 		if worked {
 			continue
 		}
-		worked, err = worker.runPackagePurgeCycle(ctx)
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				return nil
+
+		for active < w.cfg.DeliveryConcurrency {
+			delivery, ok, err := w.store.claimPackageDelivery(ctx, w.now().Unix())
+			if err != nil {
+				return stop(err)
 			}
-			return err
-		}
-		if worked {
-			continue
-		}
-		worked, err = worker.runPackageDeliveryCycle(ctx)
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				return nil
+			if !ok {
+				break
 			}
-			return err
+			var plan packageDeliveryPlan
+			if err := json.Unmarshal([]byte(delivery.Plan), &plan); err != nil {
+				retryAt := w.now().Add(retryDelay(delivery.Attempts)).Unix()
+				if markErr := w.store.markPackageRetry(ctx, delivery.PackageID, delivery.SinkID, err.Error(), retryAt, w.now().Unix()); markErr != nil {
+					return stop(markErr)
+				}
+				continue
+			}
+			w.startPackageDelivery(uploadCtx, packageDeliveryTask{delivery: delivery, plan: plan}, events)
+			active++
 		}
-		if worked {
-			continue
-		}
+
 		timer := time.NewTimer(deliveryPollInterval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil
+			return stop(nil)
+		case event := <-events:
+			timer.Stop()
+			if err := handleEvent(event); err != nil {
+				return stop(err)
+			}
 		case <-timer.C:
 		}
 	}

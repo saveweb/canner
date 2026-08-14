@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -16,6 +17,43 @@ func TestLoadConfigParsesLocalArtifactRetention(t *testing.T) {
 	}
 	if got := cfg.Projects["test"].Delivery.localArtifactRetention; got != 24*time.Hour {
 		t.Fatalf("local artifact retention = %s", got)
+	}
+}
+
+func TestLoadConfigDefaultsDeliveryConcurrency(t *testing.T) {
+	cfg, err := loadConfig(writeTestConfig(t, `"local_artifact_retention":"24h"`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DeliveryConcurrency != 2 {
+		t.Fatalf("delivery concurrency = %d", cfg.DeliveryConcurrency)
+	}
+}
+
+func TestLoadConfigParsesDeliveryConcurrency(t *testing.T) {
+	path := writeTestConfig(t, `"local_artifact_retention":"24h"`)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = []byte(strings.Replace(string(raw), `"min_free_bytes":1`, `"min_free_bytes":1,"delivery_concurrency":3`, 1))
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DeliveryConcurrency != 3 {
+		t.Fatalf("delivery concurrency = %d", cfg.DeliveryConcurrency)
+	}
+
+	raw = []byte(strings.Replace(string(raw), `"delivery_concurrency":3`, `"delivery_concurrency":-1`, 1))
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfig(path); err == nil {
+		t.Fatal("loadConfig accepted negative delivery_concurrency")
 	}
 }
 

@@ -253,6 +253,98 @@ func TestPackageDeliveryPersistsProgressWhileRunning(t *testing.T) {
 	}
 }
 
+func TestDeliverySchedulerBoundsConcurrencyAndRecoversCancellation(t *testing.T) {
+	dir := t.TempDir()
+	store, err := openDeliveryStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.close()
+	for i, identifier := range []string{"item-a", "item-b", "item-c"} {
+		packageID := "package-" + identifier
+		plan, err := json.Marshal(packageDeliveryPlan{
+			Version: 1, Sink: "internet_archive", CredentialsFile: "unused", Identifier: identifier,
+			Files: map[string]string{packageID: packageID}, RetentionNanos: int64(time.Hour),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.db.ExecContext(t.Context(), `INSERT INTO packages(package_id,project,packager,filename,manifest_filename,state,size_bytes,checksum,manifest_checksum,member_count,next_build_at,updated_at,created_at,sealed_at) VALUES(?, 'test','identity',?,?,'sealed',1,'blake3:00','blake3:00',1,0,?,?,?)`, packageID, packageID, packageID+".manifest", 100+i, 100+i, 100+i); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.db.ExecContext(t.Context(), `INSERT INTO deliveries(package_id,sink_id,state,plan,next_attempt_at,updated_at) VALUES(?,'internet_archive','pending',?,100,100)`, packageID, string(plan)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg := runtimeConfig{config: config{DataDir: dir, DeliveryConcurrency: 2}}
+	worker := newDeliveryWorker(cfg, store)
+	worker.now = func() time.Time { return time.Unix(100, 0) }
+	started := make(chan string, 3)
+	release := map[string]chan struct{}{"item-a": make(chan struct{}), "item-b": make(chan struct{}), "item-c": make(chan struct{})}
+	worker.deliverPackage = func(ctx context.Context, plan packageDeliveryPlan, _ string, _ chan<- upload.Progress) error {
+		started <- plan.Identifier
+		select {
+		case <-release[plan.Identifier]:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() { result <- worker.runScheduler(ctx) }()
+
+	first := waitForStartedDelivery(t, started)
+	second := waitForStartedDelivery(t, started)
+	select {
+	case third := <-started:
+		t.Fatalf("started %q while %q and %q were active", third, first, second)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release[first])
+	third := waitForStartedDelivery(t, started)
+	if third == first || third == second {
+		t.Fatalf("third delivery = %q after starting %q and %q", third, first, second)
+	}
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+
+	var delivered, interrupted int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM deliveries WHERE state='delivered'`).Scan(&delivered); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM deliveries WHERE state='delivering'`).Scan(&interrupted); err != nil {
+		t.Fatal(err)
+	}
+	if delivered != 1 || interrupted != 2 {
+		t.Fatalf("after cancellation: delivered=%d delivering=%d", delivered, interrupted)
+	}
+	if err := store.recoverInterruptedDeliveries(t.Context(), 200); err != nil {
+		t.Fatal(err)
+	}
+	var retrying int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM deliveries WHERE state='retry_wait' AND next_attempt_at=200`).Scan(&retrying); err != nil {
+		t.Fatal(err)
+	}
+	if retrying != 2 {
+		t.Fatalf("recovered deliveries = %d", retrying)
+	}
+}
+
+func waitForStartedDelivery(t *testing.T, started <-chan string) string {
+	t.Helper()
+	select {
+	case identifier := <-started:
+		return identifier
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for delivery to start")
+		return ""
+	}
+}
+
 func TestPackagePurgeWaitsForEveryDelivery(t *testing.T) {
 	store, err := openDeliveryStore(t.TempDir())
 	if err != nil {

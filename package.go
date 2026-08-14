@@ -729,37 +729,77 @@ func (s *deliveryStore) markPackageDeliveryProgress(ctx context.Context, package
 	return exactlyOne(result, err)
 }
 
+type packageDeliveryTask struct {
+	delivery deliveryRecord
+	plan     packageDeliveryPlan
+}
+
+type packageDeliveryEvent struct {
+	task     packageDeliveryTask
+	progress *upload.Progress
+	err      error
+	done     bool
+}
+
+func (w *deliveryWorker) startPackageDelivery(ctx context.Context, task packageDeliveryTask, events chan<- packageDeliveryEvent) {
+	go func() {
+		progress := make(chan upload.Progress, 1)
+		result := make(chan error, 1)
+		go func() {
+			result <- w.deliverPackage(ctx, task.plan, w.cfg.DataDir, progress)
+			close(progress)
+		}()
+		for snapshot := range progress {
+			event := packageDeliveryEvent{task: task, progress: &snapshot}
+			select {
+			case events <- event:
+			default:
+			}
+		}
+		events <- packageDeliveryEvent{task: task, err: <-result, done: true}
+	}()
+}
+
+func (w *deliveryWorker) handlePackageDeliveryEvent(ctx context.Context, event packageDeliveryEvent) error {
+	if event.progress != nil {
+		if err := w.store.markPackageDeliveryProgress(ctx, event.task.delivery.PackageID, event.task.delivery.SinkID, *event.progress, w.now().Unix()); err != nil {
+			slog.Warn("record package delivery progress", "package_id", event.task.delivery.PackageID, "sink_id", event.task.delivery.SinkID, "err", err)
+		}
+		return nil
+	}
+	if !event.done {
+		return nil
+	}
+	if event.err == nil {
+		deliveredAt := w.now()
+		purgeAfter := unixCeil(deliveredAt.Add(time.Duration(event.task.plan.RetentionNanos)))
+		return w.store.markPackageDelivered(ctx, event.task.delivery.PackageID, event.task.delivery.SinkID, event.task.plan.Identifier, deliveredAt.Unix(), purgeAfter)
+	}
+	retryAt := w.now().Add(retryDelay(event.task.delivery.Attempts)).Unix()
+	return w.store.markPackageRetry(ctx, event.task.delivery.PackageID, event.task.delivery.SinkID, event.err.Error(), retryAt, w.now().Unix())
+}
+
 func (w *deliveryWorker) runPackageDeliveryCycle(ctx context.Context) (bool, error) {
 	delivery, ok, err := w.store.claimPackageDelivery(ctx, w.now().Unix())
 	if err != nil || !ok {
 		return false, err
 	}
 	var plan packageDeliveryPlan
-	err = json.Unmarshal([]byte(delivery.Plan), &plan)
-	if err == nil {
-		progress := make(chan upload.Progress, 1)
-		result := make(chan error, 1)
-		go func() {
-			result <- w.deliverPackage(ctx, plan, w.cfg.DataDir, progress)
-			close(progress)
-		}()
-		for snapshot := range progress {
-			if progressErr := w.store.markPackageDeliveryProgress(ctx, delivery.PackageID, delivery.SinkID, snapshot, w.now().Unix()); progressErr != nil {
-				slog.Warn("record package delivery progress", "package_id", delivery.PackageID, "sink_id", delivery.SinkID, "err", progressErr)
-			}
-		}
-		err = <-result
+	if err := json.Unmarshal([]byte(delivery.Plan), &plan); err != nil {
+		retryAt := w.now().Add(retryDelay(delivery.Attempts)).Unix()
+		return true, w.store.markPackageRetry(ctx, delivery.PackageID, delivery.SinkID, err.Error(), retryAt, w.now().Unix())
 	}
-	if err == nil {
-		deliveredAt := w.now()
-		purgeAfter := unixCeil(deliveredAt.Add(time.Duration(plan.RetentionNanos)))
-		if err := w.store.markPackageDelivered(ctx, delivery.PackageID, delivery.SinkID, plan.Identifier, deliveredAt.Unix(), purgeAfter); err != nil {
+	events := make(chan packageDeliveryEvent, 2)
+	w.startPackageDelivery(ctx, packageDeliveryTask{delivery: delivery, plan: plan}, events)
+	for {
+		event := <-events
+		if err := w.handlePackageDeliveryEvent(ctx, event); err != nil {
 			return true, err
 		}
-		return true, nil
+		if event.done {
+			return true, nil
+		}
 	}
-	retryAt := w.now().Add(retryDelay(delivery.Attempts)).Unix()
-	return true, w.store.markPackageRetry(ctx, delivery.PackageID, delivery.SinkID, err.Error(), retryAt, w.now().Unix())
 }
 
 func (s *deliveryStore) nextPackagePurge(ctx context.Context, now int64) (packageRecord, bool, error) {

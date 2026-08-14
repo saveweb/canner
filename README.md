@@ -158,9 +158,11 @@ same one-minute-to-one-hour backoff used by delivery.
 The receiver records accepted artifacts in `data/delivery.sqlite`; `deliver`
 also reconciles immutable receipt sidecars at startup and once per hour. SQLite
 persists package membership and immutable delivery plans and must be backed up
-with the rest of `data_dir`. It processes one package at a time. A failed attempt enters
+with the rest of `data_dir`. `delivery_concurrency` bounds simultaneous sink
+uploads and defaults to `2`; packaging, cleanup, claiming, progress, and terminal
+state updates remain serialized through the scheduler. A failed attempt enters
 `retry_wait`; retries start after one minute and cap at one hour. A restart
-returns an interrupted `delivering` item to `retry_wait`. Delivery never changes
+returns interrupted `delivering` items to `retry_wait`. Delivery never changes
 the receipt or reopens the HQ job.
 
 Each Internet Archive attempt is cancellable and limited to 24 hours. Remote

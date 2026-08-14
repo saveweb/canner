@@ -24,12 +24,13 @@ func validateIAIdentifier(identifier string) error {
 }
 
 type config struct {
-	ListenAddr     string                   `json:"listen_addr"`
-	Issuer         string                   `json:"issuer"`
-	DataDir        string                   `json:"data_dir"`
-	MaxUploadBytes int64                    `json:"max_upload_bytes"`
-	MinFreeBytes   uint64                   `json:"min_free_bytes"`
-	Projects       map[string]projectConfig `json:"projects"`
+	ListenAddr          string                   `json:"listen_addr"`
+	Issuer              string                   `json:"issuer"`
+	DataDir             string                   `json:"data_dir"`
+	MaxUploadBytes      int64                    `json:"max_upload_bytes"`
+	MinFreeBytes        uint64                   `json:"min_free_bytes"`
+	DeliveryConcurrency int                      `json:"delivery_concurrency"`
+	Projects            map[string]projectConfig `json:"projects"`
 }
 
 type projectConfig struct {
@@ -68,8 +69,14 @@ func loadConfig(path string) (runtimeConfig, error) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return runtimeConfig{}, fmt.Errorf("parse config: %w", err)
 	}
+	if cfg.DeliveryConcurrency == 0 {
+		cfg.DeliveryConcurrency = 2
+	}
 	if cfg.ListenAddr == "" || cfg.DataDir == "" || cfg.MaxUploadBytes < 1 || cfg.MinFreeBytes < 1 {
 		return runtimeConfig{}, fmt.Errorf("listen_addr, data_dir, positive max_upload_bytes, and positive min_free_bytes are required")
+	}
+	if cfg.DeliveryConcurrency < 1 {
+		return runtimeConfig{}, fmt.Errorf("delivery_concurrency must be positive")
 	}
 	issuerURL, err := url.Parse(cfg.Issuer)
 	if err != nil || issuerURL.Scheme == "" || issuerURL.Host == "" {
