@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -53,6 +54,51 @@ func TestIdentityPackagingConfigRequiresNoThresholds(t *testing.T) {
 	}
 	if _, err := loadConfig(path); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMaterializeIdentityPayloadAcrossFilesystems(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "source")
+	body := []byte("identity package")
+	if err := os.WriteFile(sourcePath, body, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	destination, err := os.CreateTemp("/dev/shm", ".canner-identity-test-*")
+	if err != nil {
+		t.Skipf("create destination on /dev/shm: %v", err)
+	}
+	destinationPath := destination.Name()
+	if err := destination.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(destinationPath); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(destinationPath)
+
+	probePath := destinationPath + ".probe"
+	if err := os.Link(sourcePath, probePath); err == nil {
+		os.Remove(probePath)
+		t.Skip("test directories are on the same filesystem")
+	} else if !errors.Is(err, syscall.EXDEV) {
+		t.Skipf("cannot verify cross-filesystem link behavior: %v", err)
+	}
+	if err := materializeIdentityPayload(sourcePath, destinationPath); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(destinationPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("identity package bytes = %q", got)
+	}
+	info, err := os.Stat(destinationPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o640 {
+		t.Fatalf("identity package mode = %o", info.Mode().Perm())
 	}
 }
 

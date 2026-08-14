@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/saveweb/go2internetarchive/pkg/upload"
@@ -575,8 +576,8 @@ func (w *deliveryWorker) materializeIdentityPackage(ctx context.Context, pkg pac
 		return err
 	}
 	defer os.Remove(outputTmp)
-	if err := os.Link(filepath.Join(w.uploadsDir, member.ObjectID), outputTmp); err != nil {
-		return fmt.Errorf("link identity package: %w", err)
+	if err := materializeIdentityPayload(filepath.Join(w.uploadsDir, member.ObjectID), outputTmp); err != nil {
+		return err
 	}
 	linked, err := os.Open(outputTmp)
 	if err != nil {
@@ -630,6 +631,37 @@ func (w *deliveryWorker) materializeIdentityPackage(ctx context.Context, pkg pac
 		return err
 	}
 	return w.store.sealPackage(ctx, pkg.PackageID, member.SizeBytes, member.Checksum, "blake3:"+hex.EncodeToString(manifestHash.Sum(nil)), w.now().Unix())
+}
+
+func materializeIdentityPayload(sourcePath, outputPath string) error {
+	if err := os.Link(sourcePath, outputPath); err == nil {
+		return nil
+	} else if !errors.Is(err, syscall.EXDEV) {
+		return fmt.Errorf("link identity package: %w", err)
+	}
+
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return fmt.Errorf("open identity package source: %w", err)
+	}
+	defer source.Close()
+	info, err := source.Stat()
+	if err != nil {
+		return fmt.Errorf("stat identity package source: %w", err)
+	}
+	output, err := os.OpenFile(outputPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
+	if err != nil {
+		return fmt.Errorf("create identity package copy: %w", err)
+	}
+	_, copyErr := io.Copy(output, source)
+	closeErr := output.Close()
+	if copyErr != nil {
+		return fmt.Errorf("copy identity package: %w", copyErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close identity package copy: %w", closeErr)
+	}
+	return nil
 }
 
 func checksumForAlgorithm(checksums []string, algorithm mergewarc.ChecksumAlgorithm) (string, error) {

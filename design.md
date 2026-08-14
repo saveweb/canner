@@ -130,10 +130,11 @@ Artifact -- ordered membership --> Package -- immutable plan --> Delivery
 - `identity`：一个 Artifact 自身就是一个 Package，payload 字节不做任何处理；
 - `mergewarc`：多个 dictionary-free WARC-Zstd Artifact 合并成一个 Package。
 
-`identity` 不维护另一套 delivery 状态机。它在同一 `data_dir` 内为 accepted artifact
-建立 hard link，原子发布单成员 Package 和 provenance manifest，随后完全复用
-Package delivery、retry 和 retention。删除 upload link 后，Package link 仍引用同一
-inode，因此不复制 payload，也不会提前释放内容。
+`identity` 不维护另一套 delivery 状态机。若 uploads 和 packages 位于同一 filesystem，
+它为 accepted artifact 建立 hard link；若 packages 是独立 mount，则复制 payload 到
+package 临时文件。两种路径都原子发布单成员 Package 和 provenance manifest，随后完全
+复用 Package delivery、retry 和 retention。删除 upload link 后，hard link 或已经 sealed
+的独立副本仍保留 payload，不会提前释放内容。
 
 `mergewarc` project 另外配置：
 

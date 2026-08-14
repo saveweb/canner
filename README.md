@@ -124,9 +124,10 @@ its bytes:
 "packaging": { "type": "identity" }
 ```
 
-Because uploads and packages share `data_dir`, the identity packager publishes
-the payload with a hard link. The normal package lifecycle then applies without
-a separate direct-delivery path.
+The identity packager publishes the payload with a hard link when uploads and
+packages are on the same filesystem. If `packages` is a separate mount, it
+copies the payload into the package temporary file instead. The normal package
+lifecycle then applies without a separate direct-delivery path.
 
 `mergewarc` aggregates dictionary-free WARC-Zstd artifacts:
 
@@ -185,8 +186,9 @@ membership, and delivery record. Failed purges retry after one minute.
 
 Sealing provides a durable, byte-exact package representation, so canner removes
 member upload paths and tus metadata after the package and manifest are synced.
-For `identity`, the package hard link keeps the same inode alive. Canner retains
-the original receipts and package membership.
+For `identity`, a same-filesystem package hard link keeps the same inode alive;
+on a separate package filesystem, the sealed copy keeps the payload available.
+Canner retains the original receipts and package membership.
 
 Run exactly one `deliver` process for a data directory. Inspect delivery state
 as JSONL with:
