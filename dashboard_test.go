@@ -18,10 +18,10 @@ func TestDashboardProjectStatus(t *testing.T) {
 	if err := s.deliveryStore.addArtifact(t.Context(), artifactRecord{ObjectID: "pending", Project: "test", Filename: "pending.warc.zst", Checksum: "blake3:00", SizeBytes: 400, AcceptedAt: s.now().Add(-30 * time.Minute).Unix()}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.deliveryStore.db.Exec(`INSERT INTO packages(package_id,project,packager,filename,manifest_filename,state,member_count,next_build_at,updated_at,created_at) VALUES('building','test','mergewarc','package','manifest','building',1,0,1,1)`); err != nil {
+	if _, err := s.deliveryStore.db.Exec(`INSERT INTO packages(package_id,project,packager,filename,manifest_filename,state,member_count,build_attempts,next_build_at,build_error,updated_at,created_at) VALUES('building-package-id','test','mergewarc','package','manifest','building',1,2,?,'no space left on device',1,1)`, s.now().Add(100*time.Second).Unix()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.deliveryStore.db.Exec(`INSERT INTO deliveries(package_id,sink_id,state,plan,next_attempt_at,progress,updated_at) VALUES('building','internet_archive','delivering','{}',0,'{"BytesUploaded":400,"TotalBytes":1000,"BytesPerSecond":200,"FilesUploaded":1,"TotalFiles":2,"CurrentFile":"package.warc.zst"}',1)`); err != nil {
+	if _, err := s.deliveryStore.db.Exec(`INSERT INTO deliveries(package_id,sink_id,state,plan,next_attempt_at,progress,updated_at) VALUES('building-package-id','internet_archive','delivering','{}',0,'{"BytesUploaded":400,"TotalBytes":1000,"BytesPerSecond":200,"FilesUploaded":1,"TotalFiles":2,"CurrentFile":"package.warc.zst"}',1)`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -39,6 +39,9 @@ func TestDashboardProjectStatus(t *testing.T) {
 	if project.BuildingPackages != 1 || project.DeliveriesActive != 1 || view.BuildingCount != 1 || view.DeliveringCount != 1 {
 		t.Fatalf("activity = project %+v, view %+v", project, view)
 	}
+	if len(project.PackageBuildErrors) != 1 || project.PackageBuildErrors[0].PackageID != "building-pac" || project.PackageBuildErrors[0].Message != "no space left on device" || project.PackageBuildErrors[0].RetryIn != 100 || project.NextPackageRetryIn != 100 {
+		t.Fatalf("package errors = %+v", project)
+	}
 	if !project.DeliveryProgress || project.DeliveryBytes != 400 || project.DeliveryTotalBytes != 1000 || project.DeliveryBytesPerSec != 200 || project.DeliveryFiles != 1 || project.DeliveryTotalFiles != 2 || project.DeliveryCurrentFile != "package.warc.zst" || project.DeliveryPercent != 40 {
 		t.Fatalf("delivery progress = %+v", project)
 	}
@@ -46,7 +49,7 @@ func TestDashboardProjectStatus(t *testing.T) {
 	if err := dashboardStatusTemplate.Execute(response, view); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"40", "400 B / 1000 B", "200 B/s", "1 / 2 files", "package.warc.zst"} {
+	for _, want := range []string{"packages pending", "1 pending", "1 retrying", "retry in 1m40s", "1 package errors", "building-pac", "no space left on device", "40", "400 B / 1000 B", "200 B/s", "1 / 2 files", "package.warc.zst"} {
 		if !strings.Contains(response.Body.String(), want) {
 			t.Errorf("dashboard does not contain %q: %s", want, response.Body.String())
 		}
