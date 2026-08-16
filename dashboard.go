@@ -3,15 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"html/template"
 	"log/slog"
 	"net/http"
-	"os"
-	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/saveweb/go2internetarchive/pkg/upload"
@@ -63,16 +59,10 @@ type dashboardView struct {
 	Projects         []dashboardProject
 	UploadingCount   int64
 	StaleUploadCount int64
+	StaleStatsReady  bool
+	StaleStatsAt     time.Time
 	BuildingCount    int64
 	DeliveringCount  int64
-}
-
-type partialUpload struct {
-	ObjectID string
-	Project  string
-	Received int64
-	Size     int64
-	Stale    bool
 }
 
 func (s *server) dashboard(response http.ResponseWriter, request *http.Request) {
@@ -114,21 +104,26 @@ func (s *server) dashboardView(ctx context.Context) (dashboardView, error) {
 	}
 	sort.Strings(projectNames)
 	view := dashboardView{UpdatedAt: now}
+	stale := s.staleUploads.Load()
+	if stale != nil {
+		view.StaleStatsReady = true
+		view.StaleStatsAt = stale.ScannedAt
+	}
 	for _, project := range projectNames {
 		projectView, err := s.deliveryStore.dashboardProject(ctx, project, s.cfg.Projects[project], now)
 		if err != nil {
 			return dashboardView{}, err
 		}
 		for _, upload := range byProject[project] {
-			if upload.Stale {
-				projectView.StaleUploads++
-				projectView.StaleUploadBytes += upload.Received
-				projectView.StaleUploadTotalBytes += upload.Size
-				continue
-			}
 			projectView.UploadingArtifacts++
 			projectView.UploadingBytes += upload.Received
 			projectView.UploadingTotalBytes += upload.Size
+		}
+		if stale != nil {
+			stats := stale.Projects[project]
+			projectView.StaleUploads = stats.Count
+			projectView.StaleUploadBytes = stats.Received
+			projectView.StaleUploadTotalBytes = stats.TotalBytes
 		}
 		view.UploadingCount += projectView.UploadingArtifacts
 		view.StaleUploadCount += projectView.StaleUploads
@@ -251,46 +246,15 @@ func (s *deliveryStore) dashboardProject(ctx context.Context, project string, cf
 }
 
 func (s *server) activeUploads() ([]partialUpload, error) {
-	entries, err := os.ReadDir(s.uploadsDir)
-	if err != nil {
-		return nil, err
-	}
 	var uploads []partialUpload
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".info") {
-			continue
-		}
-		objectID := strings.TrimSuffix(entry.Name(), ".info")
-		if _, err := os.Stat(filepath.Join(s.receiptDir, objectID+".json")); err == nil {
-			continue
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return nil, err
-		}
-		raw, err := os.ReadFile(filepath.Join(s.uploadsDir, entry.Name()))
+	for _, objectID := range s.activeUploadIDs() {
+		upload, ok, err := s.partialUpload(objectID)
 		if err != nil {
 			return nil, err
 		}
-		var info struct {
-			Size     int64             `json:"Size"`
-			MetaData map[string]string `json:"MetaData"`
+		if ok {
+			uploads = append(uploads, upload)
 		}
-		if err := json.Unmarshal(raw, &info); err != nil {
-			return nil, fmt.Errorf("parse upload info %s: %w", objectID, err)
-		}
-		var received int64
-		if stat, err := os.Stat(filepath.Join(s.uploadsDir, objectID)); err == nil {
-			received = stat.Size()
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return nil, err
-		}
-		lastAttemptEnd, err := s.partialUploadLastAttemptEnd(objectID)
-		if err != nil {
-			return nil, err
-		}
-		uploads = append(uploads, partialUpload{
-			ObjectID: objectID, Project: info.MetaData["project"], Received: received, Size: info.Size,
-			Stale: !s.uploadAttemptActive(objectID) && !lastAttemptEnd.Add(s.cfg.partialUploadRetention).After(s.now()),
-		})
 	}
 	return uploads, nil
 }
@@ -311,7 +275,7 @@ var dashboardPageTemplate = template.Must(template.New("dashboard").Parse(`<!doc
 
 var dashboardStatusTemplate = template.Must(template.New("status").Funcs(template.FuncMap{
 	"bytes": formatBytes, "duration": formatDuration,
-}).Parse(`<div class="summary"><div class="metric"><b class="number">{{.UploadingCount}}</b><span>active uploads</span></div><div class="metric"><b class="number">{{.StaleUploadCount}}</b><span>stale/incomplete</span></div><div class="metric"><b class="number">{{.BuildingCount}}</b><span>packages building</span></div><div class="metric"><b class="number">{{.DeliveringCount}}</b><span>deliveries active</span></div></div><h1>Projects</h1><div class="table-wrap"><table><thead><tr><th>Project</th><th>Artifact backlog</th><th>Next trigger</th><th>Uploading</th><th>Packaging</th><th>Delivery</th><th>Issues</th></tr></thead><tbody>{{range .Projects}}<tr><td class="project">{{.Name}}</td><td><span class="number">{{.PendingArtifacts}}</span> artifacts<br><span class="muted number">{{bytes .PendingBytes}}</span></td><td>{{if eq .TriggerBytes 0}}Immediate{{else}}<span class="number">{{bytes .BytesUntilTrigger}}</span> remaining<progress value="{{.TriggerPercent}}" max="100"></progress><span class="muted">{{if .PendingArtifacts}}or {{duration .SecondsUntilMaxWait}}{{else}}waiting for artifacts{{end}}</span>{{end}}</td><td>{{if .UploadingArtifacts}}<span class="state active"><span class="dot"></span><span class="number">{{.UploadingArtifacts}} active</span></span><br><span class="muted number">{{bytes .UploadingBytes}} / {{bytes .UploadingTotalBytes}}</span>{{else}}<span class="state"><span class="dot"></span>Idle</span>{{end}}{{if .StaleUploads}}<br><span class="state warn"><span class="dot"></span><span class="number">{{.StaleUploads}} stale/incomplete</span></span><br><span class="muted number">{{bytes .StaleUploadBytes}} / {{bytes .StaleUploadTotalBytes}}</span>{{end}}</td><td>{{if .BuildingPackages}}<span class="state active"><span class="dot"></span><span class="number">{{.BuildingPackages}} building</span></span>{{end}}{{if .RetryingPackages}}{{if .BuildingPackages}}<br>{{end}}<span class="state warn"><span class="dot"></span><span class="number">{{.RetryingPackages}} waiting to retry</span></span><br><span class="muted">{{if .NextPackageRetryIn}}retry in {{duration .NextPackageRetryIn}}{{else}}retry due{{end}}</span>{{end}}{{if .BlockedPackages}}{{if or .BuildingPackages .RetryingPackages}}<br>{{end}}<span class="state danger"><span class="dot"></span><span class="number">{{.BlockedPackages}} blocked</span></span>{{end}}{{if not (or .BuildingPackages .RetryingPackages .BlockedPackages)}}<span class="state"><span class="dot"></span>Idle</span>{{end}}</td><td>{{if .DeliveriesActive}}<span class="state active"><span class="dot"></span><span class="number">{{.DeliveriesActive}} uploading</span></span>{{if .DeliveryProgress}}<progress value="{{.DeliveryPercent}}" max="100"></progress><span class="muted number">{{bytes .DeliveryBytes}} / {{bytes .DeliveryTotalBytes}} · {{bytes .DeliveryBytesPerSec}}/s</span><br><span class="muted number">{{.DeliveryFiles}} / {{.DeliveryTotalFiles}} files</span>{{if .DeliveryCurrentFile}}<span class="muted filename">{{.DeliveryCurrentFile}}</span>{{end}}{{else}}<br><span class="muted">Starting...</span>{{end}}{{else}}<span class="state ok"><span class="dot"></span>Idle</span>{{end}}<br><span class="muted number">{{.DeliveriesPending}} pending · {{.DeliveriesRetrying}} retrying · {{.DeliveriesDelivered}} delivered</span></td><td>{{if or .BlockedPackages .PackagingErrors .PackageBuildErrors}}<span class="state danger"><span class="dot"></span><span class="number">{{.BlockedPackages}} blocked · {{.PackagingErrors}} artifact errors · {{len .PackageBuildErrors}} package errors</span></span>{{if .PackageBuildErrors}}<details class="package-issues"><summary>Show package errors</summary>{{range .PackageBuildErrors}}<div class="package-issue"><code>package {{.PackageID}} · {{if .RetryIn}}retry in {{duration .RetryIn}}{{else}}retry due{{end}}</code>{{.Message}}</div>{{end}}</details>{{end}}{{else}}<span class="state ok"><span class="dot"></span>None</span>{{end}}</td></tr>{{end}}</tbody></table></div><div class="foot"><span>Auto-refresh every 2 seconds</span><time>{{.UpdatedAt.UTC.Format "2006-01-02 15:04:05 UTC"}}</time></div>`))
+}).Parse(`<div class="summary"><div class="metric"><b class="number">{{.UploadingCount}}</b><span>active uploads</span></div><div class="metric">{{if .StaleStatsReady}}<b class="number">{{.StaleUploadCount}}</b>{{else}}<b>Scanning...</b>{{end}}<span>stale/incomplete</span></div><div class="metric"><b class="number">{{.BuildingCount}}</b><span>packages building</span></div><div class="metric"><b class="number">{{.DeliveringCount}}</b><span>deliveries active</span></div></div><h1>Projects</h1><div class="table-wrap"><table><thead><tr><th>Project</th><th>Artifact backlog</th><th>Next trigger</th><th>Uploading</th><th>Packaging</th><th>Delivery</th><th>Issues</th></tr></thead><tbody>{{range .Projects}}<tr><td class="project">{{.Name}}</td><td><span class="number">{{.PendingArtifacts}}</span> artifacts<br><span class="muted number">{{bytes .PendingBytes}}</span></td><td>{{if eq .TriggerBytes 0}}Immediate{{else}}<span class="number">{{bytes .BytesUntilTrigger}}</span> remaining<progress value="{{.TriggerPercent}}" max="100"></progress><span class="muted">{{if .PendingArtifacts}}or {{duration .SecondsUntilMaxWait}}{{else}}waiting for artifacts{{end}}</span>{{end}}</td><td>{{if .UploadingArtifacts}}<span class="state active"><span class="dot"></span><span class="number">{{.UploadingArtifacts}} active</span></span><br><span class="muted number">{{bytes .UploadingBytes}} / {{bytes .UploadingTotalBytes}}</span>{{else}}<span class="state"><span class="dot"></span>Idle</span>{{end}}{{if .StaleUploads}}<br><span class="state warn"><span class="dot"></span><span class="number">{{.StaleUploads}} stale/incomplete</span></span><br><span class="muted number">{{bytes .StaleUploadBytes}} / {{bytes .StaleUploadTotalBytes}}</span>{{end}}</td><td>{{if .BuildingPackages}}<span class="state active"><span class="dot"></span><span class="number">{{.BuildingPackages}} building</span></span>{{end}}{{if .RetryingPackages}}{{if .BuildingPackages}}<br>{{end}}<span class="state warn"><span class="dot"></span><span class="number">{{.RetryingPackages}} waiting to retry</span></span><br><span class="muted">{{if .NextPackageRetryIn}}retry in {{duration .NextPackageRetryIn}}{{else}}retry due{{end}}</span>{{end}}{{if .BlockedPackages}}{{if or .BuildingPackages .RetryingPackages}}<br>{{end}}<span class="state danger"><span class="dot"></span><span class="number">{{.BlockedPackages}} blocked</span></span>{{end}}{{if not (or .BuildingPackages .RetryingPackages .BlockedPackages)}}<span class="state"><span class="dot"></span>Idle</span>{{end}}</td><td>{{if .DeliveriesActive}}<span class="state active"><span class="dot"></span><span class="number">{{.DeliveriesActive}} uploading</span></span>{{if .DeliveryProgress}}<progress value="{{.DeliveryPercent}}" max="100"></progress><span class="muted number">{{bytes .DeliveryBytes}} / {{bytes .DeliveryTotalBytes}} · {{bytes .DeliveryBytesPerSec}}/s</span><br><span class="muted number">{{.DeliveryFiles}} / {{.DeliveryTotalFiles}} files</span>{{if .DeliveryCurrentFile}}<span class="muted filename">{{.DeliveryCurrentFile}}</span>{{end}}{{else}}<br><span class="muted">Starting...</span>{{end}}{{else}}<span class="state ok"><span class="dot"></span>Idle</span>{{end}}<br><span class="muted number">{{.DeliveriesPending}} pending · {{.DeliveriesRetrying}} retrying · {{.DeliveriesDelivered}} delivered</span></td><td>{{if or .BlockedPackages .PackagingErrors .PackageBuildErrors}}<span class="state danger"><span class="dot"></span><span class="number">{{.BlockedPackages}} blocked · {{.PackagingErrors}} artifact errors · {{len .PackageBuildErrors}} package errors</span></span>{{if .PackageBuildErrors}}<details class="package-issues"><summary>Show package errors</summary>{{range .PackageBuildErrors}}<div class="package-issue"><code>package {{.PackageID}} · {{if .RetryIn}}retry in {{duration .RetryIn}}{{else}}retry due{{end}}</code>{{.Message}}</div>{{end}}</details>{{end}}{{else}}<span class="state ok"><span class="dot"></span>None</span>{{end}}</td></tr>{{end}}</tbody></table></div><div class="foot"><span>Auto-refresh every 2 seconds{{if .StaleStatsReady}} · stale scan {{.StaleStatsAt.UTC.Format "15:04:05 UTC"}}{{end}}</span><time>{{.UpdatedAt.UTC.Format "2006-01-02 15:04:05 UTC"}}</time></div>`))
 
 func formatBytes(value int64) string {
 	units := []string{"B", "KiB", "MiB", "GiB", "TiB"}

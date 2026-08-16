@@ -3,6 +3,8 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -89,6 +91,9 @@ func TestDeliveryProgressLifecycle(t *testing.T) {
 
 func TestDashboardRoutes(t *testing.T) {
 	s := testServer(t)
+	if err := os.WriteFile(filepath.Join(s.uploadsDir, "inactive.info"), []byte("not json"), 0o640); err != nil {
+		t.Fatal(err)
+	}
 	for _, path := range []string{"/", "/dashboard/status"} {
 		request := httptest.NewRequest(http.MethodGet, path, nil)
 		response := httptest.NewRecorder()

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tus/tusd/v2/pkg/filelocker"
@@ -40,6 +41,7 @@ type server struct {
 	available      func(string) (uint64, error)
 	activeMu       sync.RWMutex
 	activeAttempts map[string]int
+	staleUploads   atomic.Pointer[staleUploadSnapshot]
 	cleanupStop    chan struct{}
 	cleanupDone    chan struct{}
 }
