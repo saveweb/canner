@@ -121,7 +121,7 @@ func (s *deliveryStore) recoverInterruptedDeliveries(ctx context.Context, now in
 }
 
 func (s *deliveryStore) nextBuildingPackage(ctx context.Context, now int64) (packageRecord, bool, error) {
-	row := s.db.QueryRowContext(ctx, `UPDATE packages SET build_attempts=build_attempts+1,updated_at=? WHERE package_id=(SELECT package_id FROM packages WHERE state='building' AND next_build_at<=? ORDER BY created_at,package_id LIMIT 1) RETURNING `+packageColumns, now, now)
+	row := s.db.QueryRowContext(ctx, `UPDATE packages SET build_attempts=build_attempts+1,build_error=NULL,updated_at=? WHERE package_id=(SELECT package_id FROM packages WHERE state='building' AND next_build_at<=? ORDER BY created_at,package_id LIMIT 1) RETURNING `+packageColumns, now, now)
 	pkg, err := scanPackage(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return packageRecord{}, false, nil

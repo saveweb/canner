@@ -126,6 +126,24 @@ func TestPackageDeliveryPlanRejectsInvalidIAIdentifier(t *testing.T) {
 	}
 }
 
+func TestClaimPackageBuildClearsRetryError(t *testing.T) {
+	store, err := openDeliveryStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.close()
+	if _, err := store.db.Exec(`INSERT INTO packages(package_id,project,packager,filename,manifest_filename,state,member_count,build_attempts,next_build_at,build_error,updated_at,created_at) VALUES('package','test','identity','package','manifest','building',1,1,100,'temporary failure',50,50)`); err != nil {
+		t.Fatal(err)
+	}
+	pkg, ok, err := store.nextBuildingPackage(t.Context(), 100)
+	if err != nil || !ok {
+		t.Fatalf("claim package = %+v, %v, %v", pkg, ok, err)
+	}
+	if pkg.BuildError != nil || pkg.BuildAttempts != 2 {
+		t.Fatalf("claimed package = %+v", pkg)
+	}
+}
+
 func TestIdentityPackageUsesOriginalArtifactBytes(t *testing.T) {
 	cfg := testConfig(t)
 	project := cfg.Projects["test"]
