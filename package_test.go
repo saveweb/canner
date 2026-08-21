@@ -452,6 +452,7 @@ func TestDeliverySchedulerBuildsWhileUploadIsActive(t *testing.T) {
 	acceptTestArtifact(t, s, []byte("first"))
 	worker := newDeliveryWorker(cfg, s.deliveryStore)
 	worker.now = s.now
+	worker.packagingPoll = 10 * time.Millisecond
 	if worked, err := worker.runPackageBuildCycle(t.Context()); err != nil || !worked {
 		t.Fatalf("initial package build = %v, %v", worked, err)
 	}
@@ -467,8 +468,29 @@ func TestDeliverySchedulerBuildsWhileUploadIsActive(t *testing.T) {
 	go func() { result <- worker.runScheduler(ctx) }()
 	progress := <-started
 
+	// Let the independent packaging scheduler observe an empty backlog before
+	// keeping the delivery side continuously busy with progress updates.
+	time.Sleep(20 * time.Millisecond)
 	acceptTestArtifact(t, s, []byte("second"))
-	progress <- upload.Progress{}
+	stopProgress := make(chan struct{})
+	progressStopped := make(chan struct{})
+	go func() {
+		defer close(progressStopped)
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopProgress:
+				return
+			case <-ticker.C:
+				select {
+				case progress <- upload.Progress{}:
+				case <-stopProgress:
+					return
+				}
+			}
+		}
+	}()
 	deadline := time.Now().Add(time.Second)
 	for {
 		var packages int
@@ -483,6 +505,8 @@ func TestDeliverySchedulerBuildsWhileUploadIsActive(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+	close(stopProgress)
+	<-progressStopped
 
 	cancel()
 	if err := <-result; err != nil {

@@ -22,6 +22,7 @@ import (
 const (
 	deliveryPollInterval      = time.Second
 	deliveryReconcileInterval = time.Hour
+	packagingPollInterval     = time.Second
 )
 
 type deliveryStore struct {
@@ -224,6 +225,7 @@ type deliveryWorker struct {
 	store          *deliveryStore
 	now            func() time.Time
 	buildPackage   func(context.Context) (bool, error)
+	packagingPoll  time.Duration
 	deliverPackage func(context.Context, packageDeliveryPlan, string, chan<- upload.Progress) error
 	uploadsDir     string
 	receiptsDir    string
@@ -231,7 +233,7 @@ type deliveryWorker struct {
 
 func newDeliveryWorker(cfg runtimeConfig, store *deliveryStore) *deliveryWorker {
 	worker := &deliveryWorker{
-		cfg: cfg, store: store, now: time.Now,
+		cfg: cfg, store: store, now: time.Now, packagingPoll: packagingPollInterval,
 		deliverPackage: deliverPackageToInternetArchive,
 		uploadsDir:     filepath.Join(cfg.DataDir, "uploads"), receiptsDir: filepath.Join(cfg.DataDir, "receipts"),
 	}
@@ -265,20 +267,19 @@ func (w *deliveryWorker) runScheduler(ctx context.Context) error {
 	workCtx, cancelWork := context.WithCancel(ctx)
 	defer cancelWork()
 	events := make(chan packageDeliveryEvent, w.cfg.DeliveryConcurrency*2)
-	buildEvents := make(chan packageBuildEvent, 1)
+	packagingDone := make(chan error, 1)
+	go func() { packagingDone <- w.runPackagingScheduler(workCtx) }()
 	active := 0
-	building := false
-	buildReady := true
 	stop := func(runErr error) error {
 		cancelWork()
-		for active > 0 || building {
+		for active > 0 || packagingDone != nil {
 			select {
 			case event := <-events:
 				if event.done {
 					active--
 				}
-			case <-buildEvents:
-				building = false
+			case <-packagingDone:
+				packagingDone = nil
 			}
 		}
 		if ctx.Err() != nil {
@@ -291,28 +292,6 @@ func (w *deliveryWorker) runScheduler(ctx context.Context) error {
 			active--
 		}
 		return w.handlePackageDeliveryEvent(ctx, event)
-	}
-	handleBuildEvent := func(event packageBuildEvent) error {
-		building = false
-		if event.err != nil {
-			return event.err
-		}
-		if event.worked {
-			buildReady = true
-			return nil
-		}
-		worked, err := w.runPackagedSourcePurgeCycle(ctx)
-		if err != nil {
-			return err
-		}
-		if !worked {
-			worked, err = w.runPackagePurgeCycle(ctx)
-			if err != nil {
-				return err
-			}
-		}
-		buildReady = worked
-		return nil
 	}
 	nextReconcile := w.now().Add(deliveryReconcileInterval)
 	for {
@@ -327,10 +306,12 @@ func (w *deliveryWorker) runScheduler(ctx context.Context) error {
 				if err := handleEvent(event); err != nil {
 					return stop(err)
 				}
-			case event := <-buildEvents:
-				if err := handleBuildEvent(event); err != nil {
+			case err := <-packagingDone:
+				packagingDone = nil
+				if err != nil {
 					return stop(err)
 				}
+				return stop(fmt.Errorf("packaging scheduler stopped unexpectedly"))
 			default:
 				break drainEvents
 			}
@@ -341,15 +322,6 @@ func (w *deliveryWorker) runScheduler(ctx context.Context) error {
 				return stop(fmt.Errorf("reconcile accepted artifacts: %w", err))
 			}
 			nextReconcile = w.now().Add(deliveryReconcileInterval)
-		}
-
-		if !building && buildReady {
-			building = true
-			buildReady = false
-			go func() {
-				worked, err := w.buildPackage(workCtx)
-				buildEvents <- packageBuildEvent{worked: worked, err: err}
-			}()
 		}
 
 		for active < w.cfg.DeliveryConcurrency {
@@ -382,20 +354,51 @@ func (w *deliveryWorker) runScheduler(ctx context.Context) error {
 			if err := handleEvent(event); err != nil {
 				return stop(err)
 			}
-		case event := <-buildEvents:
+		case err := <-packagingDone:
 			timer.Stop()
-			if err := handleBuildEvent(event); err != nil {
+			packagingDone = nil
+			if err != nil {
 				return stop(err)
 			}
+			return stop(fmt.Errorf("packaging scheduler stopped unexpectedly"))
 		case <-timer.C:
-			buildReady = true
 		}
 	}
 }
 
-type packageBuildEvent struct {
-	worked bool
-	err    error
+func (w *deliveryWorker) runPackagingScheduler(ctx context.Context) error {
+	for {
+		worked, err := w.buildPackage(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		if !worked {
+			worked, err = w.runPackagedSourcePurgeCycle(ctx)
+			if err != nil {
+				return err
+			}
+		}
+		if !worked {
+			worked, err = w.runPackagePurgeCycle(ctx)
+			if err != nil {
+				return err
+			}
+		}
+		if worked {
+			continue
+		}
+
+		timer := time.NewTimer(w.packagingPoll)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+	}
 }
 
 func acquireDeliveryLock(dataDir string) (*flock.Flock, error) {
