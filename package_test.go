@@ -490,6 +490,75 @@ func TestDeliverySchedulerBuildsWhileUploadIsActive(t *testing.T) {
 	}
 }
 
+func TestDeliverySchedulerRecordsProgressWhilePackageBuildIsActive(t *testing.T) {
+	dir := t.TempDir()
+	store, err := openDeliveryStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.close()
+	plan, err := json.Marshal(packageDeliveryPlan{
+		Version: 1, Sink: "internet_archive", CredentialsFile: "unused", Identifier: "item",
+		Files: map[string]string{"package": "package"}, RetentionNanos: int64(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(t.Context(), `INSERT INTO packages(package_id,project,packager,filename,manifest_filename,state,size_bytes,checksum,manifest_checksum,member_count,next_build_at,updated_at,created_at,sealed_at) VALUES('package','test','identity','package','manifest','sealed',100,'blake3:00','blake3:00',1,0,100,100,100)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(t.Context(), `INSERT INTO deliveries(package_id,sink_id,state,plan,next_attempt_at,updated_at) VALUES('package','internet_archive','pending',?,100,100)`, string(plan)); err != nil {
+		t.Fatal(err)
+	}
+
+	worker := newDeliveryWorker(runtimeConfig{config: config{DataDir: dir, DeliveryConcurrency: 1}}, store)
+	worker.now = func() time.Time { return time.Unix(100, 0) }
+	buildStarted := make(chan struct{})
+	releaseBuild := make(chan struct{})
+	worker.buildPackage = func(ctx context.Context) (bool, error) {
+		close(buildStarted)
+		select {
+		case <-releaseBuild:
+			return false, nil
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+	uploadStarted := make(chan chan<- upload.Progress, 1)
+	worker.deliverPackage = func(ctx context.Context, _ packageDeliveryPlan, _ string, progress chan<- upload.Progress) error {
+		uploadStarted <- progress
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() { result <- worker.runScheduler(ctx) }()
+	<-buildStarted
+	progress := <-uploadStarted
+	progress <- upload.Progress{BytesUploaded: 40, TotalBytes: 100, BytesPerSecond: 20, CurrentFile: "package"}
+
+	var raw *string
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+		if err := store.db.QueryRow(`SELECT progress FROM deliveries WHERE package_id='package'`).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		if raw != nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if raw == nil || !strings.Contains(*raw, `"BytesUploaded":40`) {
+		t.Fatalf("progress while package build is active = %v", raw)
+	}
+
+	close(releaseBuild)
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDeliverySchedulerPackagesWithoutSinkDeliveryAtZeroConcurrency(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.DeliveryConcurrency = 0
