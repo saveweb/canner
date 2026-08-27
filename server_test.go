@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -226,8 +228,16 @@ func testServer(t *testing.T) *server {
 
 func testConfig(t *testing.T) runtimeConfig {
 	t.Helper()
+	dataDir := t.TempDir()
+	packageDir := filepath.Join(dataDir, "packages")
+	if err := os.MkdirAll(packageDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(packageDir, packageDirectoryAnchor), nil, 0o640); err != nil {
+		t.Fatal(err)
+	}
 	return runtimeConfig{config: config{
-		Issuer: "https://canner.example", DataDir: t.TempDir(), MaxUploadBytes: 1 << 20, MinFreeBytes: 1,
+		Issuer: "https://canner.example", DataDir: dataDir, MaxUploadBytes: 1 << 20, MinFreeBytes: 1,
 		Projects: map[string]projectConfig{"test": {}},
 	}}
 }

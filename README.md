@@ -18,7 +18,11 @@ go run . serve config.json
 go run . deliver config.json
 ```
 
-Production deployments should mount `data_dir` from persistent storage.
+Production deployments should mount `data_dir` from persistent storage. Create
+an empty `packages/.canner-keep` regular file on the package storage before
+starting canner. Both long-running commands exit with a non-zero status when
+the file is absent, allowing the container restart policy to recover from a
+package mount that became ready after the container first started.
 
 ## Upload protocol
 
@@ -131,8 +135,9 @@ packages are on the same filesystem. If `packages` is a separate mount, it
 copies the payload into the package temporary file instead. The normal package
 lifecycle then applies without a separate direct-delivery path.
 
-Canner retains a `.canner-keep` file in `packages` so remote filesystems do not
-remove the directory as empty while a large temporary package is still open.
+Canner requires a pre-existing `.canner-keep` regular file in `packages`. It is
+both a directory-retention file for remote storage and a startup sentinel that
+prevents canner from writing packages into an unmounted local directory.
 
 `mergewarc` aggregates dictionary-free WARC-Zstd artifacts:
 

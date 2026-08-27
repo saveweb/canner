@@ -30,6 +30,9 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+		if err := requirePackageStorage(cfg.DataDir); err != nil {
+			return err
+		}
 		server, err := newServer(cfg)
 		if err != nil {
 			return err
@@ -44,6 +47,9 @@ func run(args []string) error {
 		}
 		cfg, err := loadConfig(args[1])
 		if err != nil {
+			return err
+		}
+		if err := requirePackageStorage(cfg.DataDir); err != nil {
 			return err
 		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

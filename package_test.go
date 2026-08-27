@@ -57,6 +57,29 @@ func TestIdentityPackagingConfigRequiresNoThresholds(t *testing.T) {
 	}
 }
 
+func TestRequirePackageStorage(t *testing.T) {
+	dataDir := t.TempDir()
+	anchor := filepath.Join(dataDir, "packages", packageDirectoryAnchor)
+	if err := requirePackageStorage(dataDir); err == nil || !strings.Contains(err.Error(), "packages storage is not mounted") {
+		t.Fatalf("missing anchor error = %v", err)
+	}
+	if err := os.MkdirAll(anchor, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := requirePackageStorage(dataDir); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("directory anchor error = %v", err)
+	}
+	if err := os.Remove(anchor); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(anchor, nil, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := requirePackageStorage(dataDir); err != nil {
+		t.Fatalf("regular anchor: %v", err)
+	}
+}
+
 func TestMaterializeIdentityPayloadAcrossFilesystems(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "source")
 	body := []byte("identity package")
@@ -163,6 +186,7 @@ func TestIdentityPackageUsesOriginalArtifactBytes(t *testing.T) {
 	acceptTestArtifact(t, s, body)
 	worker := newDeliveryWorker(cfg, s.deliveryStore)
 	worker.now = s.now
+	packageDir := filepath.Join(cfg.DataDir, "packages")
 	if worked, err := worker.runPackageBuildCycle(t.Context()); err != nil || !worked {
 		t.Fatalf("identity build = %v, %v", worked, err)
 	}
@@ -179,7 +203,7 @@ func TestIdentityPackageUsesOriginalArtifactBytes(t *testing.T) {
 		t.Fatalf("members = %+v, %v", members, err)
 	}
 	sourcePath := filepath.Join(cfg.DataDir, "uploads", members[0].ObjectID)
-	packagePath := filepath.Join(cfg.DataDir, "packages", pkg.Filename)
+	packagePath := filepath.Join(packageDir, pkg.Filename)
 	if _, err := os.Stat(filepath.Join(cfg.DataDir, "packages", packageDirectoryAnchor)); err != nil {
 		t.Fatalf("package directory anchor: %v", err)
 	}

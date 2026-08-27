@@ -487,7 +487,7 @@ func (w *deliveryWorker) materializePackage(ctx context.Context, pkg packageReco
 			return err
 		}
 	}
-	if err := ensurePackageDirectory(packageDir); err != nil {
+	if err := requirePackageStorage(w.cfg.DataDir); err != nil {
 		return err
 	}
 	if pkg.Packager == "identity" {
@@ -561,20 +561,14 @@ func (w *deliveryWorker) materializePackage(ctx context.Context, pkg packageReco
 	return nil
 }
 
-func ensurePackageDirectory(path string) error {
-	anchor, err := os.OpenFile(filepath.Join(path, packageDirectoryAnchor), os.O_WRONLY|os.O_CREATE, 0o640)
+func requirePackageStorage(dataDir string) error {
+	path := filepath.Join(dataDir, "packages", packageDirectoryAnchor)
+	info, err := os.Stat(path)
 	if err != nil {
-		return fmt.Errorf("create package directory anchor: %w", err)
+		return fmt.Errorf("packages storage is not mounted: missing %s: %w", path, err)
 	}
-	if err := anchor.Sync(); err != nil {
-		anchor.Close()
-		return fmt.Errorf("sync package directory anchor: %w", err)
-	}
-	if err := anchor.Close(); err != nil {
-		return fmt.Errorf("close package directory anchor: %w", err)
-	}
-	if err := syncDirectory(path); err != nil {
-		return fmt.Errorf("sync package directory: %w", err)
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("packages storage is not mounted: %s is not a regular file", path)
 	}
 	return nil
 }
