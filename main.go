@@ -37,6 +37,9 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+		if err := server.releaseOrphanedUploadLocks(); err != nil {
+			return err
+		}
 		server.startPartialUploadCleanup()
 		defer server.close()
 		slog.Info("listening", "addr", cfg.ListenAddr, "issuer", cfg.Issuer)

@@ -152,6 +152,36 @@ func (s *server) partialUploadLastAttemptEnd(objectID string) (time.Time, error)
 	return time.Time{}, os.ErrNotExist
 }
 
+// releaseOrphanedUploadLocks removes tusd lock files left by a previous
+// receiver process. The lock records the holder's PID, which is always 1 inside
+// a container, so a restarted receiver sees its predecessor's lock as held by a
+// live process and never reclaims it. It must run before the receiver serves
+// requests. Uploads with receipts are skipped because delivery locks those.
+func (s *server) releaseOrphanedUploadLocks() error {
+	entries, err := os.ReadDir(s.uploadsDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".lock") {
+			continue
+		}
+		objectID := strings.TrimSuffix(entry.Name(), ".lock")
+		if _, err := os.Stat(s.receiptPath(objectID)); err == nil {
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		for _, suffix := range []string{".lock", ".stop"} {
+			if err := os.Remove(filepath.Join(s.uploadsDir, objectID+suffix)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove orphaned upload lock %s: %w", objectID, err)
+			}
+		}
+		slog.Info("released orphaned upload lock", "object_id", objectID)
+	}
+	return syncDirectory(s.uploadsDir)
+}
+
 func (s *server) startPartialUploadCleanup() {
 	go s.runPartialUploadCleanup()
 }

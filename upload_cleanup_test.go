@@ -106,6 +106,53 @@ func TestCleanupRemovesOnlyStalePartialUploads(t *testing.T) {
 	}
 }
 
+func TestCleanupRemovesStaleUploadAfterReleasingOrphanedLock(t *testing.T) {
+	s := testServer(t)
+	s.cfg.partialUploadRetention = 30 * time.Minute
+	now := time.Unix(1_700_000_000, 0)
+	s.now = func() time.Time { return now }
+
+	location := createUpload(t, s, "test", 10, blake3Checksum([]byte("0123456789")))
+	objectID := strings.TrimPrefix(location, "/files/")
+	old := now.Add(-31 * time.Minute)
+	for _, suffix := range []string{"", ".info"} {
+		if err := os.Chtimes(filepath.Join(s.uploadsDir, objectID+suffix), old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A previous receiver in the same PID namespace died while holding the lock.
+	for suffix, content := range map[string]string{".lock": fmtInt(int64(os.Getpid())), ".stop": ""} {
+		if err := os.WriteFile(filepath.Join(s.uploadsDir, objectID+suffix), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	receiptLock := filepath.Join(s.uploadsDir, "delivered.lock")
+	if err := os.WriteFile(s.receiptPath("delivered"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(receiptLock, []byte(fmtInt(int64(os.Getpid()))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if removed, err := s.cleanupStalePartialUploads(t.Context()); err != nil || removed != 0 {
+		t.Fatalf("cleanup with orphaned lock removed = %d, err = %v", removed, err)
+	}
+	if err := s.releaseOrphanedUploadLocks(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(receiptLock); err != nil {
+		t.Fatalf("lock of receipted upload was removed: %v", err)
+	}
+	if removed, err := s.cleanupStalePartialUploads(t.Context()); err != nil || removed != 1 {
+		t.Fatalf("cleanup after releasing lock removed = %d, err = %v", removed, err)
+	}
+	for _, suffix := range []string{"", ".info", ".lock", ".stop"} {
+		if _, err := os.Stat(filepath.Join(s.uploadsDir, objectID+suffix)); !os.IsNotExist(err) {
+			t.Fatalf("stale upload suffix %q still exists: %v", suffix, err)
+		}
+	}
+}
+
 func TestCleanupDoesNotHoldActiveMutexWhileWaitingForUploadLock(t *testing.T) {
 	s := testServer(t)
 	s.cfg.partialUploadRetention = 30 * time.Minute
